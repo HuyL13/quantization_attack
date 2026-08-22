@@ -191,6 +191,17 @@ def run_blockwise_local_reconstruction(
                 recon_accum += float(recon.detach())
 
             optim.step()
+            if torch.cuda.is_available() and step % 5 == 0:
+                # Each step moves several cached CPU tensors (hidden_states,
+                # attention_mask, position_embeddings, ...) to GPU fresh via
+                # _to_device and lets them go out of scope - thousands of
+                # these small alloc/free cycles across 32 blocks x steps x
+                # batches_per_step measurably fragmented the CUDA caching
+                # allocator enough to OOM a 40GB A100 well before total
+                # logical usage should have required it (crashed with 39.32
+                # GiB "in use" but only ~172 MiB actually requested at the
+                # failing allocation). Periodic empty_cache() defragments.
+                torch.cuda.empty_cache()
             loss_value = recon_accum + float(reg_loss.detach())
             for name in block_layer_modules:
                 trace_by_layer[name].append(

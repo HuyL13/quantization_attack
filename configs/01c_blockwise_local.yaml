@@ -5,10 +5,10 @@ method:
   group_size: 128
   lambda_distance: 0.1
   round_reg_weight: 1.0
-  steps: 30
+  steps: 20
   lr: 0.01
-  batches_per_step: 4
-  calib_batch_size: 4
+  batches_per_step: 2
+  calib_batch_size: 2
   max_seq_len: 512
   max_new_tokens: 32
   max_ppl_relative_regression: 0.05
