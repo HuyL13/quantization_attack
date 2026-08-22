@@ -3,6 +3,7 @@ import copy
 import torch
 
 from aq.calibration_strategies import (
+    _release_quantizer,
     run_block_wise,
     run_isolated,
     run_quantized_prefix,
@@ -30,6 +31,14 @@ def test_run_isolated_commits_both_layers(tiny_model, tiny_calibration_batches):
     for name, mod in layers.items():
         assert not torch.equal(mod.weight.detach(), originals[name])
         assert torch.equal(mod.weight.detach(), results[name].hard_weight)
+        # staged on CPU between optimization and the final commit loop - see
+        # run_isolated's comment (holding all ~224 layers' hard_weight on GPU
+        # simultaneously measurably grew GPU memory run over run).
+        assert results[name].hard_weight.device.type == "cpu"
+        # quantizer's own GPU/CPU buffers must be released once hard_weight
+        # is extracted - keeping every layer's quantizer alive is what caused
+        # a real OOM on the actual 7B model (see _release_quantizer's docstring).
+        assert results[name].quantizer is None
 
 
 def test_run_quantized_prefix_commits_sequentially(tiny_model, tiny_calibration_batches):
@@ -61,6 +70,19 @@ def test_run_quantized_prefix_commits_sequentially(tiny_model, tiny_calibration_
     # layer 0's weight at the moment layer 1 starts must equal its committed
     # hard weight (i.e. already quantized), not the original FP weight.
     assert torch.equal(call_log[1][1], results["mid_layers.0"].hard_weight)
+    assert all(results[name].quantizer is None for name in order)
+
+
+def test_release_quantizer_drops_reference():
+    from aq.calibration_strategies import LayerOptimizationResult
+
+    fake_quantizer = torch.nn.Linear(2, 2)  # stand-in for AdversarialLinearQuantizer
+    result = LayerOptimizationResult(
+        layer_name="x", quantizer=fake_quantizer, hard_weight=torch.zeros(2, 2), trace_rows=[], layer_metrics={}
+    )
+    _release_quantizer(result)
+    assert result.quantizer is None
+    assert result.hard_weight is not None  # everything else stays intact
 
 
 def test_run_block_wise_joint_optimizes_group(tiny_model, tiny_calibration_batches):
@@ -76,6 +98,7 @@ def test_run_block_wise_joint_optimizes_group(tiny_model, tiny_calibration_batch
         assert len(results[name].trace_rows) == cfg.steps
         # every layer in the block shares the same joint loss trajectory
         assert results[name].trace_rows[0]["loss"] == results[order[0]].trace_rows[0]["loss"]
+        assert results[name].quantizer is None
 
 
 def test_two_pass_backward_correction_uses_pristine_reference(tiny_model, tiny_calibration_batches):
@@ -96,3 +119,4 @@ def test_two_pass_backward_correction_uses_pristine_reference(tiny_model, tiny_c
         assert len(results[name].trace_rows) == 2 * cfg.steps
         assert "forward_pass_final_kl" in results[name].layer_metrics
         assert "backward_pass_final_kl" in results[name].layer_metrics
+        assert results[name].quantizer is None

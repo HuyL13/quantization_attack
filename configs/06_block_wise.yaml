@@ -7,8 +7,9 @@ method:
   use_codebook: false
   use_sensitivity: false
   lambda_distance: 0.1
-  steps: 100
+  steps: 30
   lr: 0.01
+  batches_per_step: 4
   calib_batch_size: 4
   max_seq_len: 512
   max_new_tokens: 32

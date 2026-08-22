@@ -37,7 +37,7 @@ def estimate_weight_sensitivity(
         attention_mask = batch.get("attention_mask")
         if attention_mask is not None:
             attention_mask = attention_mask.to(device)
-        out = model(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids)
+        out = model(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids, use_cache=False)
         loss = out.loss
         loss.backward()
         if weight.grad is not None:

@@ -150,6 +150,15 @@ def get_transformer_linear_layers(model) -> "dict[str, Any]":
     return layers
 
 
+def get_block_modules(model) -> "list":
+    """The actual transformer block nn.Modules (model.model.layers[i]), in
+    depth order - used by method 1C to run a SINGLE block's own forward
+    (block(x)) directly, instead of the whole model, for its local
+    reconstruction loss.
+    """
+    return list(model.model.layers)
+
+
 def get_block_layer_groups(model) -> "list[list[str]]":
     """One group per transformer block, each holding that block's linear
     layer names in the order returned by get_transformer_linear_layers -

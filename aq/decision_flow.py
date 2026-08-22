@@ -14,9 +14,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+# Method 1 (Adversarial Rounding) is itself a light-to-heavy chain, not one
+# monolithic tier: 1A never touches gradients or the model at all (a single
+# closed-form greedy pass); 1B and 1C use cached LOCAL activations (one
+# Linear layer's / one block's own forward) instead of a full-model KL pass;
+# 1D (the original single-tier design) is the expensive fallback, reran
+# through the whole 32-layer network on every optimization step. Measured
+# live: 1D costs ~2.79s per optimization step per layer (a full-model
+# forward + checkpointed backward) - each lighter tier is only reached if
+# the one before it fails both the PPL and watermark gates.
 METHOD_ORDER = [
     "00_rtn4",
-    "01_adv_round",
+    "01a_greedy_round",
+    "01b_layerwise_local",
+    "01c_blockwise_local",
+    "01d_global_kl",
     "02_adv_round_scale",
     "03_adv_codebook",
     "04_sensitivity_aware",
@@ -28,7 +40,10 @@ METHOD_ORDER = [
 
 METHOD_LABELS = {
     "00_rtn4": "RTN4 baseline",
-    "01_adv_round": "Adversarial Rounding",
+    "01a_greedy_round": "Adversarial Rounding (1A: greedy, zero-training)",
+    "01b_layerwise_local": "Adversarial Rounding (1B: layer-wise local reconstruction)",
+    "01c_blockwise_local": "Adversarial Rounding (1C: block-wise local reconstruction)",
+    "01d_global_kl": "Adversarial Rounding (1D: global KL-guided)",
     "02_adv_round_scale": "Joint Rounding + Scale",
     "03_adv_codebook": "Non-Uniform Codebook",
     "04_sensitivity_aware": "Sensitivity-Aware",

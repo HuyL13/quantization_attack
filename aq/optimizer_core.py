@@ -8,6 +8,7 @@ the objective (plan: "một core objective duy nhất cho toàn bộ 9 method").
 """
 from __future__ import annotations
 
+import random
 import time
 from dataclasses import dataclass
 
@@ -65,6 +66,16 @@ class _LayerForwardPatch:
 
 @torch.no_grad()
 def compute_fp_reference_logits(model, calibration_batches: list[dict], device: str) -> list[torch.Tensor]:
+    """Returns one CPU tensor per calibration batch (full-vocab logits, kept
+    for the entire multi-layer run). Deliberately NOT left on GPU: with 128
+    calibration batches this cache alone is ~17GB in bf16 (batch=4,
+    seq_len=512, vocab=32000), which combined with the ~14.5GB resident
+    model left under 10GB of headroom for any per-step activation memory -
+    measured live: an A100 OOM'd within ~20s of starting method 01, before a
+    single layer's optimization step even completed. Each entry is moved
+    back to GPU transiently, one batch at a time, only when its KL term is
+    actually being computed (see optimize_layer / run_block_wise).
+    """
     model.eval()
     refs = []
     for batch in calibration_batches:
@@ -72,8 +83,8 @@ def compute_fp_reference_logits(model, calibration_batches: list[dict], device: 
         attention_mask = batch.get("attention_mask")
         if attention_mask is not None:
             attention_mask = attention_mask.to(device)
-        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
-        refs.append(logits.detach())
+        logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
+        refs.append(logits.detach().to("cpu"))
     return refs
 
 
@@ -99,33 +110,54 @@ def optimize_layer(
     trainable = [p for p in quantizer.parameters() if p.requires_grad]
     optim = torch.optim.Adam(trainable, lr=cfg.lr)
 
+    all_pairs = list(zip(fp_reference_logits, calibration_batches))
     trace_rows: list[dict] = []
     for step in range(cfg.steps):
         optim.zero_grad()
-        soft_w = quantizer.soft_weight()
-        kl_sum = torch.zeros((), device=device)
-        with _LayerForwardPatch(module, lambda: soft_w):
-            for ref_logits, batch in zip(fp_reference_logits, calibration_batches):
-                input_ids = batch["input_ids"].to(device)
-                attention_mask = batch.get("attention_mask")
-                if attention_mask is not None:
-                    attention_mask = attention_mask.to(device)
-                out_logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
-                kl_sum = kl_sum + kl_divergence_logits(ref_logits, out_logits)
-        kl_term = kl_sum / max(len(calibration_batches), 1)
+
+        # The distance/regularizer terms don't depend on calibration batches
+        # at all - backward them once, then accumulate the KL term ONE
+        # calibration batch at a time (each batch's full-model forward graph
+        # is freed by its own .backward() call before the next batch starts).
+        # Summing every batch's logits into one kl_sum tensor BEFORE a single
+        # backward() call (the original design) keeps all of their forward
+        # activation graphs alive simultaneously - measured live: with 32
+        # calibration batches this OOM'd a 40GB A100 on the very first layer
+        # (39.46 GiB in use, forward pass inside model.mlp.down_proj).
         distance_term = quantizer.weight_distance()
         round_reg = quantizer.rounding_regularizer()
-        loss = kl_term - cfg.lambda_distance * distance_term + cfg.round_reg_weight * round_reg
+        reg_loss = cfg.round_reg_weight * round_reg - cfg.lambda_distance * distance_term
+        reg_loss.backward()
 
-        loss.backward()
+        # Mini-batch, not the full fixed calibration set every step - see
+        # AdversarialQuantConfig.batches_per_step's docstring for why (a
+        # full-calibration-set sweep on every step, for every layer, does
+        # not finish in a practical amount of time on a 7B model).
+        step_pairs = random.sample(all_pairs, min(cfg.batches_per_step, len(all_pairs)))
+        n_batches = max(len(step_pairs), 1)
+        kl_accum = 0.0
+        for ref_logits, batch in step_pairs:
+            soft_w = quantizer.soft_weight()  # fresh graph per batch, freed after this batch's backward
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
+            with _LayerForwardPatch(module, lambda w=soft_w: w):
+                out_logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
+            ref_logits_gpu = ref_logits.to(device, non_blocking=True)  # cached on CPU - see compute_fp_reference_logits
+            kl_batch = kl_divergence_logits(ref_logits_gpu, out_logits) / n_batches
+            kl_batch.backward()
+            kl_accum += float(kl_batch.detach())
+
         optim.step()
 
+        loss_value = kl_accum + float(reg_loss.detach())
         trace_rows.append(
             {
                 "layer": layer_name,
                 "step": step,
-                "loss": float(loss.detach()),
-                "kl": float(kl_term.detach()),
+                "loss": loss_value,
+                "kl": kl_accum,
                 "distance": float(distance_term.detach()),
                 "round_reg": float(round_reg.detach()),
                 "timestamp": time.time(),

@@ -3,12 +3,7 @@ model:
 method:
   bits: 4
   group_size: 128
-  optimize_scale: false
-  use_codebook: false
-  use_sensitivity: false
-  lambda_distance: 0.1
-  steps: 200
-  lr: 0.01
+  flip_fraction: 0.2
   calib_batch_size: 4
   max_seq_len: 512
   max_new_tokens: 32

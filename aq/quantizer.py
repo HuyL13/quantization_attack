@@ -30,6 +30,14 @@ class AdversarialQuantConfig:
     round_reg_weight: float = 1.0         # AdaRound-style push toward hard 0/1 (see rounding_regularizer)
     steps: int = 200
     lr: float = 1e-2
+    batches_per_step: int = 4             # mini-batch size: how many calibration batches to sample PER STEP
+    # (not the full fixed calibration set every step - looping over all 128
+    # calibration samples' worth of batches on every one of `steps`
+    # iterations, for every one of ~224 target layers, is the difference
+    # between a run finishing in hours vs. days; measured live: a 5-step,
+    # 128-batches/step smoke test did not finish a single layer in over 3
+    # minutes. Mini-batch sampling is also standard practice for this kind
+    # of per-layer calibration, not a shortcut - see aq/optimizer_core.py.)
 
 
 class AdversarialLinearQuantizer(nn.Module):

@@ -10,9 +10,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from types import SimpleNamespace
 
-from aq.common import get_block_layer_groups, get_transformer_linear_layers
+from aq.activation_cache import capture_block_input_activations, capture_layer_input_activations
+from aq.common import get_block_layer_groups, get_block_modules, get_transformer_linear_layers
 from aq.optimizer_core import compute_fp_reference_logits
 from aq.calibration_strategies import run_isolated, run_quantized_prefix
+from aq.greedy_rounding import GreedyRoundingConfig, run_greedy_adversarial_rounding
+from aq.local_reconstruction import run_blockwise_local_reconstruction, run_layerwise_local_reconstruction
 from aq.quantizer import AdversarialQuantConfig
 from aq.run_method import _apply_rtn4_baseline, _run_strategy
 
@@ -71,7 +74,7 @@ class FakeCausalLM(nn.Module):
         self.model = FakeInner(vocab, h, n_layers)
         self.lm_head = nn.Linear(h, vocab, bias=False)
 
-    def forward(self, input_ids, attention_mask=None, labels=None):
+    def forward(self, input_ids, attention_mask=None, labels=None, use_cache=None):
         x = self.model(input_ids)
         logits = self.lm_head(x)
         loss = None
@@ -123,7 +126,7 @@ def test_run_strategy_dispatch_isolated_methods(monkeypatch):
     fp_ref = compute_fp_reference_logits(model, batches, device="cpu")
     cfg = AdversarialQuantConfig(bits=4, group_size=128, steps=2, lr=1e-2)
 
-    for method_id in ["01_adv_round", "02_adv_round_scale", "03_adv_codebook", "04_sensitivity_aware"]:
+    for method_id in ["01d_global_kl", "02_adv_round_scale", "03_adv_codebook", "04_sensitivity_aware"]:
         # fresh model per method to avoid cross-method state leakage in this test
         m = FakeCausalLM(n_layers=2)
         l = get_transformer_linear_layers(m)
@@ -173,3 +176,55 @@ def test_run_strategy_dispatch_periodic_refresh():
     cfg.refresh_every_k_blocks = 2
     results = _run_strategy("07_periodic_refresh", m, l, o, bg, b, ref, cfg, "cpu")
     assert set(results.keys()) == set(o)
+
+
+def test_method_1a_greedy_rounding_against_real_block_shaped_model():
+    m = FakeCausalLM(n_layers=2)
+    l = get_transformer_linear_layers(m)
+    o = list(l.keys())
+    b = _fake_batches()
+    originals = {name: mod.weight.detach().clone() for name, mod in l.items()}
+
+    cached = capture_layer_input_activations(m, l, b, device="cpu")
+    cfg = GreedyRoundingConfig(bits=4, group_size=128, flip_fraction=0.2)
+    results = run_greedy_adversarial_rounding(m, l, o, cached, cfg, device="cpu")
+
+    assert set(results.keys()) == set(o)
+    for name, mod in l.items():
+        assert not torch.equal(mod.weight.detach(), originals[name])
+    out = m(input_ids=b[0]["input_ids"])
+    assert torch.isfinite(out.logits).all()
+
+
+def test_method_1b_layerwise_local_against_real_block_shaped_model():
+    m = FakeCausalLM(n_layers=2)
+    l = get_transformer_linear_layers(m)
+    o = list(l.keys())
+    b = _fake_batches()
+
+    cached = capture_layer_input_activations(m, l, b, device="cpu")
+    cfg = AdversarialQuantConfig(bits=4, group_size=128, steps=2, lr=1e-2, batches_per_step=1)
+    results = run_layerwise_local_reconstruction(l, o, cached, cfg, device="cpu")
+
+    assert set(results.keys()) == set(o)
+    out = m(input_ids=b[0]["input_ids"])
+    assert torch.isfinite(out.logits).all()
+
+
+def test_method_1c_blockwise_local_against_real_block_shaped_model():
+    m = FakeCausalLM(n_layers=2)
+    l = get_transformer_linear_layers(m)
+    block_groups = get_block_layer_groups(m)
+    block_modules = get_block_modules(m)
+    b = _fake_batches()
+
+    block_module_map = {str(i): mod for i, mod in enumerate(block_modules)}
+    cached_by_idx = capture_block_input_activations(m, block_module_map, b, device="cpu")
+    cached_block_inputs = [cached_by_idx[str(i)] for i in range(len(block_modules))]
+
+    cfg = AdversarialQuantConfig(bits=4, group_size=128, steps=2, lr=1e-2, batches_per_step=1)
+    results = run_blockwise_local_reconstruction(block_groups, l, block_modules, cached_block_inputs, cfg, device="cpu")
+
+    assert set(results.keys()) == set(l.keys())
+    out = m(input_ids=b[0]["input_ids"])
+    assert torch.isfinite(out.logits).all()

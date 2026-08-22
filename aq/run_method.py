@@ -25,6 +25,7 @@ from aq.common import (
     ensure_if_awq_tier0_on_path,
     free_model,
     get_block_layer_groups,
+    get_block_modules,
     get_transformer_linear_layers,
     gpu_peak_memory_bytes,
     load_causal_lm,
@@ -41,7 +42,10 @@ from aq.calibration_strategies import (
     run_quantized_prefix,
     run_two_pass_backward_correction,
 )
+from aq.activation_cache import capture_block_input_activations, capture_layer_input_activations
 from aq.decision_flow import GateConfig, MethodOutcome, STATUS_PASS, decide_next_action
+from aq.greedy_rounding import GreedyRoundingConfig, run_greedy_adversarial_rounding
+from aq.local_reconstruction import run_blockwise_local_reconstruction, run_layerwise_local_reconstruction
 from aq.logging_utils import (
     get_run_logger,
     run_dir_for,
@@ -58,6 +62,14 @@ from aq.quantizer import AdversarialQuantConfig
 from aq.reporting import generate_method_report
 from aq.rtn_backend import rtn_quantize_weight_raw
 
+# Methods 1A/1B/1C never run the full 32-layer model during optimization
+# (1A is gradient-free; 1B/1C optimize against cached LOCAL activations) -
+# so they skip gradient checkpointing / model.train() (nothing to
+# checkpoint) and the expensive full-model fp_reference_logits cache (no
+# global KL term at all). Every other method (1D and 02-08) is a full-model
+# global-KL method and needs both.
+LOCAL_METHODS = {"01a_greedy_round", "01b_layerwise_local", "01c_blockwise_local"}
+
 
 def _apply_rtn4_baseline(layers: dict) -> None:
     import torch
@@ -70,7 +82,7 @@ def _apply_rtn4_baseline(layers: dict) -> None:
 
 
 def _run_strategy(method_id: str, model, layers: dict, order, block_groups, calibration_batches, fp_ref, cfg, device):
-    if method_id == "01_adv_round" or method_id == "02_adv_round_scale" or method_id == "03_adv_codebook" or method_id == "04_sensitivity_aware":
+    if method_id in ("01d_global_kl", "02_adv_round_scale", "03_adv_codebook", "04_sensitivity_aware"):
         return run_isolated(model, layers, order, calibration_batches, fp_ref, cfg, device)
     if method_id == "05_quantized_prefix":
         return run_quantized_prefix(model, layers, order, calibration_batches, fp_ref, cfg, device)
@@ -108,6 +120,23 @@ def run_one_method(
     model = load_causal_lm(model_id, device=device, dtype=dtype)
     tokenizer = load_tokenizer(model_id)
 
+    is_full_model_method = method_id != "00_rtn4" and method_id not in LOCAL_METHODS
+    if is_full_model_method:
+        # Every full-model method backprops from the loss through however
+        # many of the model's 32 decoder blocks sit between the patched
+        # layer and the output - for a layer near the start that's a
+        # full-depth backward pass. Storing every intermediate activation
+        # for that (the default) OOM'd a 40GB A100 within ~20-30s even with
+        # calib_batch_size=4/seq_len=512 and only one layer being trained at
+        # a time - not from batch size, but from activation memory scaling
+        # with the full 32-layer depth. Gradient checkpointing recomputes
+        # activations during backward instead of storing them, trading
+        # ~20-30% more compute for an order-of-magnitude memory cut.
+        # Methods 1A-1C never run the full model during optimization (see
+        # LOCAL_METHODS), so none of this applies to them.
+        model.gradient_checkpointing_enable()
+        model.config.use_cache = False
+
     layers = get_transformer_linear_layers(model)
     order = list(layers.keys())
     block_groups = get_block_layer_groups(model)
@@ -119,6 +148,66 @@ def run_one_method(
     if method_id == "00_rtn4":
         logger.info("applying RTN4 baseline to %d layers", len(layers))
         _apply_rtn4_baseline(layers)
+    elif method_id in LOCAL_METHODS:
+        calibration_texts = load_calibration_texts(method_cfg.get("calibration_path", default_calibration_path()))
+        calibration_batches = build_calibration_batches(
+            tokenizer,
+            calibration_texts,
+            max_seq_len=method_cfg.get("max_seq_len", 512),
+            batch_size=method_cfg.get("calib_batch_size", 4),
+            device=device,
+        )
+
+        if method_id == "01a_greedy_round":
+            logger.info("capturing per-layer input activations over %d calibration batches", len(calibration_batches))
+            cached_layer_inputs = capture_layer_input_activations(model, layers, calibration_batches, device)
+            greedy_cfg = GreedyRoundingConfig(
+                bits=method_cfg.get("bits", 4),
+                group_size=method_cfg.get("group_size", 128),
+                flip_fraction=method_cfg.get("flip_fraction", 0.2),
+            )
+            logger.info("running greedy adversarial rounding (1A) over %d target layers", len(layers))
+            results = run_greedy_adversarial_rounding(model, layers, order, cached_layer_inputs, greedy_cfg, device)
+        elif method_id == "01b_layerwise_local":
+            logger.info("capturing per-layer input activations over %d calibration batches", len(calibration_batches))
+            cached_layer_inputs = capture_layer_input_activations(model, layers, calibration_batches, device)
+            cfg = AdversarialQuantConfig(
+                bits=method_cfg.get("bits", 4),
+                group_size=method_cfg.get("group_size", 128),
+                lambda_distance=method_cfg.get("lambda_distance", 0.1),
+                round_reg_weight=method_cfg.get("round_reg_weight", 1.0),
+                steps=method_cfg.get("steps", 50),
+                lr=method_cfg.get("lr", 1e-2),
+                batches_per_step=method_cfg.get("batches_per_step", 4),
+            )
+            logger.info("running layer-wise local reconstruction (1B) over %d target layers", len(layers))
+            results = run_layerwise_local_reconstruction(layers, order, cached_layer_inputs, cfg, device)
+        else:  # 01c_blockwise_local
+            block_modules = get_block_modules(model)
+            block_module_map = {str(i): m for i, m in enumerate(block_modules)}
+            logger.info("capturing per-block input activations over %d calibration batches", len(calibration_batches))
+            cached_block_inputs_by_idx = capture_block_input_activations(
+                model, block_module_map, calibration_batches, device
+            )
+            cached_block_inputs = [cached_block_inputs_by_idx[str(i)] for i in range(len(block_modules))]
+            cfg = AdversarialQuantConfig(
+                bits=method_cfg.get("bits", 4),
+                group_size=method_cfg.get("group_size", 128),
+                lambda_distance=method_cfg.get("lambda_distance", 0.1),
+                round_reg_weight=method_cfg.get("round_reg_weight", 1.0),
+                steps=method_cfg.get("steps", 30),
+                lr=method_cfg.get("lr", 1e-2),
+                batches_per_step=method_cfg.get("batches_per_step", 4),
+            )
+            logger.info("running block-wise local reconstruction (1C) over %d blocks", len(block_groups))
+            results = run_blockwise_local_reconstruction(
+                block_groups, layers, block_modules, cached_block_inputs, cfg, device
+            )
+
+        for name in order:
+            if name in results:
+                all_layer_metrics.append(results[name].layer_metrics)
+                all_trace_rows.extend(results[name].trace_rows)
     else:
         cfg = AdversarialQuantConfig(
             bits=method_cfg.get("bits", 4),
@@ -128,8 +217,10 @@ def run_one_method(
             n_codebook_centroids=method_cfg.get("n_codebook_centroids", 16),
             use_sensitivity=method_cfg.get("use_sensitivity", False),
             lambda_distance=method_cfg.get("lambda_distance", 0.1),
+            round_reg_weight=method_cfg.get("round_reg_weight", 1.0),
             steps=method_cfg.get("steps", 200),
             lr=method_cfg.get("lr", 1e-2),
+            batches_per_step=method_cfg.get("batches_per_step", 4),
         )
         cfg.refresh_every_k_blocks = method_cfg.get("refresh_every_k_blocks", 8)
 
@@ -144,10 +235,19 @@ def run_one_method(
         logger.info("computing FP reference logits over %d calibration batches", len(calibration_batches))
         fp_reference_logits = compute_fp_reference_logits(model, calibration_batches, device)
 
+        # Gradient checkpointing (enabled above) only actually recomputes
+        # activations - instead of just running a plain forward with nothing
+        # to save memory on - when the model is in train() mode; several
+        # transformers versions gate the recomputation behind self.training.
+        # Llama's own config has no dropout by default, so train() vs eval()
+        # changes nothing about the forward math here, only whether
+        # checkpointing engages.
+        model.train()
         logger.info("running strategy for %s over %d target layers", method_id, len(layers))
         results = _run_strategy(
             method_id, model, layers, order, block_groups, calibration_batches, fp_reference_logits, cfg, device
         )
+        model.eval()
         for name in order:
             if name in results:
                 all_layer_metrics.append(results[name].layer_metrics)
@@ -224,7 +324,8 @@ def run_one_method(
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--method", required=True, choices=[
-        "00_rtn4", "01_adv_round", "02_adv_round_scale", "03_adv_codebook", "04_sensitivity_aware",
+        "00_rtn4", "01a_greedy_round", "01b_layerwise_local", "01c_blockwise_local", "01d_global_kl",
+        "02_adv_round_scale", "03_adv_codebook", "04_sensitivity_aware",
         "05_quantized_prefix", "06_block_wise", "07_periodic_refresh", "08_two_pass_backward",
     ])
     ap.add_argument("--config", required=True, help="YAML with model/method sections")

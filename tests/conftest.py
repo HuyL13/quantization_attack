@@ -30,7 +30,7 @@ class TinyLM(nn.Module):
         )
         self.head = nn.Linear(hidden, vocab, bias=False)
 
-    def forward(self, input_ids, attention_mask=None, labels=None):
+    def forward(self, input_ids, attention_mask=None, labels=None, use_cache=None):
         x = self.embed(input_ids)
         for layer in self.mid_layers:
             x = torch.tanh(layer(x))

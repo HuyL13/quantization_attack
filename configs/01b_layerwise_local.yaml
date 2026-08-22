@@ -3,11 +3,9 @@ model:
 method:
   bits: 4
   group_size: 128
-  optimize_scale: true
-  use_codebook: false
-  use_sensitivity: false
   lambda_distance: 0.1
-  steps: 10
+  round_reg_weight: 1.0
+  steps: 50
   lr: 0.01
   batches_per_step: 4
   calib_batch_size: 4
