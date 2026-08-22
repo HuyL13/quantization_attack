@@ -48,7 +48,7 @@ from aq.activation_cache import (
     compute_layer_activation_sensitivity,
 )
 from aq.behavior_gradient import compute_behavior_and_utility_gradients
-from aq.decision_flow import GateConfig, MethodOutcome, STATUS_PASS, decide_next_action
+from aq.decision_flow import GateConfig, MethodOutcome, STATUS_PASS, decide_next_action, evaluate_watermark_gate
 from aq.greedy_rounding import GreedyRoundingConfig, run_greedy_adversarial_rounding
 from aq.local_reconstruction import run_blockwise_local_reconstruction, run_layerwise_local_reconstruction
 from aq.selective_quantization import SelectiveQuantConfig, run_selective_quantization
@@ -121,6 +121,7 @@ def run_one_method(
     out_root: Path,
     device: str = "cuda",
     dtype: str = "bfloat16",
+    force_watermark_eval: bool = False,
 ) -> MethodOutcome:
     ensure_if_awq_tier0_on_path()
     from src.eval_wikitext import compute_wikitext2_ppl
@@ -363,10 +364,16 @@ def run_one_method(
         outcome = MethodOutcome(method_id=method_id, status="BASELINE", ppl=candidate_ppl, rtn4_ppl=candidate_ppl)
     else:
         pre_gate = decide_next_action(method_id, candidate_ppl, rtn4_ppl, gate_cfg)
-        if pre_gate.status != "SKIPPED":
+        if pre_gate.status != "SKIPPED" and not force_watermark_eval:
             outcome = pre_gate
             logger.info("PPL gate: %s -> stopping before watermark eval", outcome.detail)
         else:
+            if pre_gate.status != "SKIPPED":
+                logger.info(
+                    "PPL gate: %s -> FAILED, but --force-watermark-eval was set: running watermark eval anyway "
+                    "for diagnostic purposes only (this outcome is NOT a real PASS candidate)",
+                    pre_gate.detail,
+                )
             fingerprints = read_json(method_cfg.get("fingerprint_keys_path", default_fingerprint_keys_path()))
             logger.info("running watermark verification (%d keys)", len(fingerprints))
             t1 = time.time()
@@ -380,14 +387,26 @@ def run_one_method(
             )
             watermark_summary = summarize(per_key, evaluation_time_seconds=time.time() - t1)
             write_watermark_result_json(run_dir, {"summary": watermark_summary, "per_key": per_key})
-            outcome = decide_next_action(
-                method_id,
-                candidate_ppl,
-                rtn4_ppl,
-                gate_cfg,
-                watermark_fsr_exact=watermark_summary["fsr_exact"],
-                watermark_fsr_contains=watermark_summary["fsr_contains"],
-            )
+            watermark_gone, watermark_detail = evaluate_watermark_gate(watermark_summary["fsr_exact"], gate_cfg)
+            if pre_gate.status == "SKIPPED":
+                # Normal path: PPL gate passed, watermark result is the real gate.
+                outcome = decide_next_action(
+                    method_id,
+                    candidate_ppl,
+                    rtn4_ppl,
+                    gate_cfg,
+                    watermark_fsr_exact=watermark_summary["fsr_exact"],
+                    watermark_fsr_contains=watermark_summary["fsr_contains"],
+                )
+            else:
+                # force_watermark_eval diagnostic path: PPL gate already
+                # FAILED, so this can never be a real PASS - keep the
+                # original FAIL_UTILITY status but attach the watermark
+                # numbers for inspection only.
+                outcome = pre_gate
+                outcome.watermark_fsr_exact = watermark_summary["fsr_exact"]
+                outcome.watermark_fsr_contains = watermark_summary["fsr_contains"]
+                outcome.detail = pre_gate.detail + " | [diagnostic only, PPL already failed] " + watermark_detail
             logger.info("watermark gate: %s", outcome.detail)
 
     model_metrics = {
@@ -418,6 +437,12 @@ def main() -> None:
     ap.add_argument("--output", required=True)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    ap.add_argument(
+        "--force-watermark-eval",
+        action="store_true",
+        help="Run watermark verification even if the PPL gate fails - diagnostic only, "
+        "the reported status still stays FAIL_UTILITY (never becomes PASS).",
+    )
     args = ap.parse_args()
 
     configure_gpu_performance()
@@ -444,6 +469,7 @@ def main() -> None:
         out_root,
         device=args.device,
         dtype=args.dtype,
+        force_watermark_eval=args.force_watermark_eval,
     )
     print(f"[run_method] {args.method} -> {outcome.status} ({outcome.detail})")
     if outcome.status == STATUS_PASS:
