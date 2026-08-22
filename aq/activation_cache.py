@@ -62,18 +62,28 @@ def capture_block_input_activations(
     transformer blocks (e.g. model.model.layers[i]) instead of individual
     Linear layers - used by method 1C's block-level reconstruction.
     """
-    captured: dict[str, list[torch.Tensor]] = {name: [] for name in block_modules}
+    # A transformer decoder block's forward needs more than the hidden-states
+    # tensor: LlamaModel computes rotary position_embeddings (and
+    # attention_mask/position_ids/cache_position) ONCE per forward pass and
+    # passes them into EVERY block as kwargs - calling a block directly with
+    # only its hidden-states input (a plain forward_pre_hook only sees
+    # positional args, not kwargs) crashes deep inside self_attn trying to
+    # unpack a None `position_embeddings`. with_kwargs=True captures the full
+    # call signature so it can be replayed exactly for both the FP-reference
+    # and quantized-candidate forward later.
+    captured: dict[str, list[dict]] = {name: [] for name in block_modules}
     handles = []
 
     def make_hook(name):
-        def hook(_module, inputs):
-            x = inputs[0] if isinstance(inputs, tuple) else inputs
-            captured[name].append(x.detach().to("cpu"))
+        def hook(_module, args, kwargs):
+            captured[name].append(
+                {"args": _to_cpu(args), "kwargs": _to_cpu(kwargs)}
+            )
 
         return hook
 
     for name, module in block_modules.items():
-        handles.append(module.register_forward_pre_hook(make_hook(name)))
+        handles.append(module.register_forward_pre_hook(make_hook(name), with_kwargs=True))
 
     model.eval()
     try:
@@ -88,6 +98,35 @@ def capture_block_input_activations(
             h.remove()
 
     return captured
+
+
+def _to_cpu(obj):
+    """Recursively moves every tensor found in a (possibly nested)
+    tuple/list/dict to CPU, leaving every other value (None, bool, int, ...)
+    untouched - used to cache a block's full forward call signature without
+    holding it on the GPU.
+    """
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().to("cpu")
+    if isinstance(obj, tuple):
+        return tuple(_to_cpu(v) for v in obj)
+    if isinstance(obj, list):
+        return [_to_cpu(v) for v in obj]
+    if isinstance(obj, dict):
+        return {k: _to_cpu(v) for k, v in obj.items()}
+    return obj
+
+
+def _to_device(obj, device: str):
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device)
+    if isinstance(obj, tuple):
+        return tuple(_to_device(v, device) for v in obj)
+    if isinstance(obj, list):
+        return [_to_device(v, device) for v in obj]
+    if isinstance(obj, dict):
+        return {k: _to_device(v, device) for k, v in obj.items()}
+    return obj
 
 
 @torch.no_grad()

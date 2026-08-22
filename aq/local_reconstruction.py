@@ -27,6 +27,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from aq.activation_cache import _to_device
 from aq.calibration_strategies import _commit, _release_quantizer
 from aq.metrics import cosine_similarity_flat, rounding_flip_ratio, scale_relative_shift
 from aq.optimizer_core import LayerOptimizationResult, _LayerForwardPatch
@@ -118,7 +119,7 @@ def run_blockwise_local_reconstruction(
     block_groups: list[list[str]],
     layers: dict,
     block_modules_by_group: list[nn.Module],
-    cached_block_inputs: list[list[torch.Tensor]],
+    cached_block_inputs: list[list[dict]],
     cfg: AdversarialQuantConfig,
     device: str,
 ) -> dict[str, LayerOptimizationResult]:
@@ -159,10 +160,19 @@ def run_blockwise_local_reconstruction(
             step_inputs = random.sample(cached_inputs, min(cfg.batches_per_step, len(cached_inputs)))
             n_batches = max(len(step_inputs), 1)
             recon_accum = 0.0
-            for x_cpu in step_inputs:
-                x = x_cpu.to(device)
+            for cached_call in step_inputs:
+                # Replay the block's FULL original call signature (not just
+                # hidden_states) - a real transformer block needs rotary
+                # position_embeddings/attention_mask/etc. that its parent
+                # model computes once and passes to every block; calling the
+                # block with only its input tensor crashes deep inside
+                # self_attn (verified live: "cannot unpack non-iterable
+                # NoneType object" trying to unpack a None
+                # position_embeddings). See aq.activation_cache._to_device.
+                call_args = _to_device(cached_call["args"], device)
+                call_kwargs = _to_device(cached_call["kwargs"], device)
                 with torch.no_grad():
-                    y_fp = block_module(x)
+                    y_fp = block_module(*call_args, **call_kwargs)
                     y_fp = y_fp[0] if isinstance(y_fp, tuple) else y_fp
 
                 soft_weights = {name: q.soft_weight() for name, q in quantizers.items()}
@@ -170,7 +180,7 @@ def run_blockwise_local_reconstruction(
                 for p in patches:
                     p.__enter__()
                 try:
-                    y_q = block_module(x)
+                    y_q = block_module(*call_args, **call_kwargs)
                     y_q = y_q[0] if isinstance(y_q, tuple) else y_q
                 finally:
                     for p in patches:
