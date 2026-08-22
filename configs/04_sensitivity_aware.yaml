@@ -1,0 +1,16 @@
+model:
+  id: cnut1648/LLaMA2-7B-fingerprinted-SFT
+method:
+  bits: 4
+  group_size: 128
+  optimize_scale: false
+  use_codebook: false
+  use_sensitivity: true
+  lambda_distance: 0.1
+  steps: 200
+  lr: 0.01
+  calib_batch_size: 4
+  max_seq_len: 512
+  max_new_tokens: 32
+  max_ppl_relative_regression: 0.05
+  max_fsr_exact_for_pass: 0.0

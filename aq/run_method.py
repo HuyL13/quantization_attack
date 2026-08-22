@@ -1,0 +1,268 @@
+"""CLI entrypoint: run ONE method of the adversarial quantization plan against
+the IF-SFT LLaMA2-7B checkpoint, gate it, and write every artifact plan
+section 13 requires. Intended to be called repeatedly (00_rtn4, 01_..., ...)
+by scripts/run_all_methods.sh, which stops the loop as soon as one method
+returns PASS.
+
+Reuses if_awq_tier0's WikiText-2 PPL evaluator and IF-SFT watermark
+verification verbatim - this file only wires them into the adversarial
+quantization + gating pipeline.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import time
+from pathlib import Path
+
+from aq.common import (
+    FINGERPRINT_TARGET,
+    IF_SFT_MODEL_ID,
+    configure_gpu_performance,
+    default_calibration_path,
+    default_fingerprint_keys_path,
+    ensure_dir,
+    ensure_if_awq_tier0_on_path,
+    free_model,
+    get_block_layer_groups,
+    get_transformer_linear_layers,
+    gpu_peak_memory_bytes,
+    load_causal_lm,
+    load_tokenizer,
+    load_yaml_config,
+    read_json,
+    write_json,
+)
+from aq.calibration import build_calibration_batches, load_calibration_texts
+from aq.calibration_strategies import (
+    run_block_wise,
+    run_isolated,
+    run_periodic_refresh,
+    run_quantized_prefix,
+    run_two_pass_backward_correction,
+)
+from aq.decision_flow import GateConfig, MethodOutcome, STATUS_PASS, decide_next_action
+from aq.logging_utils import (
+    get_run_logger,
+    run_dir_for,
+    write_config_yaml,
+    write_layer_metrics_csv,
+    write_model_metrics_json,
+    write_optimization_trace_csv,
+    write_ppl_result_json,
+    write_watermark_result_json,
+)
+from aq.optimizer_core import compute_fp_reference_logits
+from aq.plotting import plot_kl_vs_distance_trace, plot_rounding_flip_ratio_per_layer
+from aq.quantizer import AdversarialQuantConfig
+from aq.reporting import generate_method_report
+from aq.rtn_backend import rtn_quantize_weight_raw
+
+
+def _apply_rtn4_baseline(layers: dict) -> None:
+    import torch
+
+    for name, module in layers.items():
+        w = module.weight.detach().clone()
+        state = rtn_quantize_weight_raw(w, bits=4, group_size=128)
+        with torch.no_grad():
+            module.weight.data.copy_(state.dequantize_truncated().to(module.weight.dtype))
+
+
+def _run_strategy(method_id: str, model, layers: dict, order, block_groups, calibration_batches, fp_ref, cfg, device):
+    if method_id == "01_adv_round" or method_id == "02_adv_round_scale" or method_id == "03_adv_codebook" or method_id == "04_sensitivity_aware":
+        return run_isolated(model, layers, order, calibration_batches, fp_ref, cfg, device)
+    if method_id == "05_quantized_prefix":
+        return run_quantized_prefix(model, layers, order, calibration_batches, fp_ref, cfg, device)
+    if method_id == "06_block_wise":
+        return run_block_wise(model, layers, block_groups, calibration_batches, fp_ref, cfg, device)
+    if method_id == "07_periodic_refresh":
+        refresh_k = getattr(cfg, "refresh_every_k_blocks", 8)
+        return run_periodic_refresh(
+            model, layers, order, calibration_batches, fp_ref, cfg, device, refresh_k, block_groups
+        )
+    if method_id == "08_two_pass_backward":
+        return run_two_pass_backward_correction(model, layers, order, calibration_batches, fp_ref, cfg, device)
+    raise ValueError(f"unknown method_id {method_id}")
+
+
+def run_one_method(
+    method_id: str,
+    model_cfg: dict,
+    method_cfg: dict,
+    rtn4_ppl: float,
+    out_root: Path,
+    device: str = "cuda",
+    dtype: str = "bfloat16",
+) -> MethodOutcome:
+    ensure_if_awq_tier0_on_path()
+    from src.eval_wikitext import compute_wikitext2_ppl
+    from src.verify_fingerprint import run_verification, summarize
+
+    run_dir = run_dir_for(out_root, method_id)
+    logger = get_run_logger(run_dir, method_id)
+    write_config_yaml(run_dir, {"method_id": method_id, "model": model_cfg, "method": method_cfg})
+
+    model_id = model_cfg.get("id", IF_SFT_MODEL_ID)
+    logger.info("loading model %s", model_id)
+    model = load_causal_lm(model_id, device=device, dtype=dtype)
+    tokenizer = load_tokenizer(model_id)
+
+    layers = get_transformer_linear_layers(model)
+    order = list(layers.keys())
+    block_groups = get_block_layer_groups(model)
+
+    t0 = time.time()
+    all_layer_metrics: list[dict] = []
+    all_trace_rows: list[dict] = []
+
+    if method_id == "00_rtn4":
+        logger.info("applying RTN4 baseline to %d layers", len(layers))
+        _apply_rtn4_baseline(layers)
+    else:
+        cfg = AdversarialQuantConfig(
+            bits=method_cfg.get("bits", 4),
+            group_size=method_cfg.get("group_size", 128),
+            optimize_scale=method_cfg.get("optimize_scale", False),
+            use_codebook=method_cfg.get("use_codebook", False),
+            n_codebook_centroids=method_cfg.get("n_codebook_centroids", 16),
+            use_sensitivity=method_cfg.get("use_sensitivity", False),
+            lambda_distance=method_cfg.get("lambda_distance", 0.1),
+            steps=method_cfg.get("steps", 200),
+            lr=method_cfg.get("lr", 1e-2),
+        )
+        cfg.refresh_every_k_blocks = method_cfg.get("refresh_every_k_blocks", 8)
+
+        calibration_texts = load_calibration_texts(method_cfg.get("calibration_path", default_calibration_path()))
+        calibration_batches = build_calibration_batches(
+            tokenizer,
+            calibration_texts,
+            max_seq_len=method_cfg.get("max_seq_len", 512),
+            batch_size=method_cfg.get("calib_batch_size", 4),
+            device=device,
+        )
+        logger.info("computing FP reference logits over %d calibration batches", len(calibration_batches))
+        fp_reference_logits = compute_fp_reference_logits(model, calibration_batches, device)
+
+        logger.info("running strategy for %s over %d target layers", method_id, len(layers))
+        results = _run_strategy(
+            method_id, model, layers, order, block_groups, calibration_batches, fp_reference_logits, cfg, device
+        )
+        for name in order:
+            if name in results:
+                all_layer_metrics.append(results[name].layer_metrics)
+                all_trace_rows.extend(results[name].trace_rows)
+
+    elapsed = time.time() - t0
+    logger.info("quantization pass finished in %.1fs", elapsed)
+
+    write_layer_metrics_csv(run_dir, all_layer_metrics)
+    write_optimization_trace_csv(run_dir, all_trace_rows)
+    if all_trace_rows:
+        plot_kl_vs_distance_trace(all_trace_rows, run_dir / "kl_vs_distance.png", title=method_id)
+    if all_layer_metrics:
+        plot_rounding_flip_ratio_per_layer(all_layer_metrics, run_dir / "rounding_flip_ratio.png", title=method_id)
+
+    logger.info("computing WikiText-2 PPL")
+    ppl_result = compute_wikitext2_ppl(model, tokenizer, device=device)
+    write_ppl_result_json(run_dir, ppl_result)
+    candidate_ppl = ppl_result["wikitext2_ppl"]
+
+    gate_cfg = GateConfig(
+        max_ppl_relative_regression=method_cfg.get("max_ppl_relative_regression", 0.05),
+        max_fsr_exact_for_pass=method_cfg.get("max_fsr_exact_for_pass", 0.0),
+    )
+
+    if method_id == "00_rtn4":
+        # RTN4 is the fixed reference point, never gated against itself.
+        outcome = MethodOutcome(method_id=method_id, status="BASELINE", ppl=candidate_ppl, rtn4_ppl=candidate_ppl)
+    else:
+        pre_gate = decide_next_action(method_id, candidate_ppl, rtn4_ppl, gate_cfg)
+        if pre_gate.status != "SKIPPED":
+            outcome = pre_gate
+            logger.info("PPL gate: %s -> stopping before watermark eval", outcome.detail)
+        else:
+            fingerprints = read_json(method_cfg.get("fingerprint_keys_path", default_fingerprint_keys_path()))
+            logger.info("running watermark verification (%d keys)", len(fingerprints))
+            t1 = time.time()
+            per_key = run_verification(
+                model,
+                tokenizer,
+                fingerprints,
+                do_sample=False,
+                max_new_tokens=method_cfg.get("max_new_tokens", 32),
+                device=device,
+            )
+            watermark_summary = summarize(per_key, evaluation_time_seconds=time.time() - t1)
+            write_watermark_result_json(run_dir, {"summary": watermark_summary, "per_key": per_key})
+            outcome = decide_next_action(
+                method_id,
+                candidate_ppl,
+                rtn4_ppl,
+                gate_cfg,
+                watermark_fsr_exact=watermark_summary["fsr_exact"],
+                watermark_fsr_contains=watermark_summary["fsr_contains"],
+            )
+            logger.info("watermark gate: %s", outcome.detail)
+
+    model_metrics = {
+        "method_id": method_id,
+        "ppl": candidate_ppl,
+        "peak_gpu_memory_bytes": gpu_peak_memory_bytes(),
+        "elapsed_seconds": elapsed,
+        "num_layers_touched": len(layers) if method_id != "00_rtn4" else len(layers),
+    }
+    outcome.model_metrics = model_metrics
+    write_model_metrics_json(run_dir, model_metrics)
+    generate_method_report(outcome, run_dir, out_root / "reports" / f"{method_id}_report.md")
+
+    free_model(model)
+    del model
+    return outcome
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--method", required=True, choices=[
+        "00_rtn4", "01_adv_round", "02_adv_round_scale", "03_adv_codebook", "04_sensitivity_aware",
+        "05_quantized_prefix", "06_block_wise", "07_periodic_refresh", "08_two_pass_backward",
+    ])
+    ap.add_argument("--config", required=True, help="YAML with model/method sections")
+    ap.add_argument("--rtn4-ppl", type=float, default=None, help="Baseline PPL from the 00_rtn4 run (required for methods 01-08)")
+    ap.add_argument("--output", required=True)
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    args = ap.parse_args()
+
+    configure_gpu_performance()
+    cfg = load_yaml_config(args.config)
+    out_root = ensure_dir(Path(args.output))
+
+    rtn4_ppl = args.rtn4_ppl
+    if rtn4_ppl is None:
+        if args.method == "00_rtn4":
+            rtn4_ppl = float("nan")
+        else:
+            baseline_path = out_root / "runs" / "00_rtn4" / "ppl_result.json"
+            if not baseline_path.exists():
+                raise SystemExit(
+                    f"--rtn4-ppl not given and {baseline_path} does not exist - run 00_rtn4 first."
+                )
+            rtn4_ppl = json.loads(baseline_path.read_text(encoding="utf-8"))["wikitext2_ppl"]
+
+    outcome = run_one_method(
+        args.method,
+        cfg.get("model", {}),
+        cfg.get("method", {}),
+        rtn4_ppl,
+        out_root,
+        device=args.device,
+        dtype=args.dtype,
+    )
+    print(f"[run_method] {args.method} -> {outcome.status} ({outcome.detail})")
+    if outcome.status == STATUS_PASS:
+        print("[run_method] WATERMARK REMOVED WITH ACCEPTABLE PPL - stop testing further methods.")
+
+
+if __name__ == "__main__":
+    main()
