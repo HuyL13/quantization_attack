@@ -42,7 +42,11 @@ from aq.calibration_strategies import (
     run_quantized_prefix,
     run_two_pass_backward_correction,
 )
-from aq.activation_cache import capture_block_input_activations, capture_layer_input_activations
+from aq.activation_cache import (
+    capture_block_input_activations,
+    capture_layer_input_activations,
+    compute_layer_activation_sensitivity,
+)
 from aq.decision_flow import GateConfig, MethodOutcome, STATUS_PASS, decide_next_action
 from aq.greedy_rounding import GreedyRoundingConfig, run_greedy_adversarial_rounding
 from aq.local_reconstruction import run_blockwise_local_reconstruction, run_layerwise_local_reconstruction
@@ -150,6 +154,20 @@ def run_one_method(
         _apply_rtn4_baseline(layers)
     elif method_id in LOCAL_METHODS:
         calibration_texts = load_calibration_texts(method_cfg.get("calibration_path", default_calibration_path()))
+        if method_id in ("01b_layerwise_local", "01c_blockwise_local"):
+            # Unlike 1A (streaming, no raw storage - see
+            # compute_layer_activation_sensitivity), 1B/1C genuinely cache
+            # every calibration batch's raw activation tensor for EVERY
+            # target layer/block simultaneously (needed for reconstruction).
+            # At the full 128-sample calibration set this measured out to
+            # >130GB of resident CPU memory and climbing for 1A before the
+            # streaming fix - 1B/1C would be worse (real tensors, not a
+            # running sum). Capping the sample count keeps this bounded;
+            # a few dozen samples is already a standard calibration size for
+            # this kind of local reconstruction (GPTQ/AWQ-style methods
+            # commonly use O(100) samples over much longer sequences than
+            # this cuts down to).
+            calibration_texts = calibration_texts[: method_cfg.get("calibration_samples", 32)]
         calibration_batches = build_calibration_batches(
             tokenizer,
             calibration_texts,
@@ -159,15 +177,17 @@ def run_one_method(
         )
 
         if method_id == "01a_greedy_round":
-            logger.info("capturing per-layer input activations over %d calibration batches", len(calibration_batches))
-            cached_layer_inputs = capture_layer_input_activations(model, layers, calibration_batches, device)
+            logger.info(
+                "computing streaming activation sensitivity over %d calibration batches", len(calibration_batches)
+            )
+            sensitivity_by_layer = compute_layer_activation_sensitivity(model, layers, calibration_batches, device)
             greedy_cfg = GreedyRoundingConfig(
                 bits=method_cfg.get("bits", 4),
                 group_size=method_cfg.get("group_size", 128),
                 flip_fraction=method_cfg.get("flip_fraction", 0.2),
             )
             logger.info("running greedy adversarial rounding (1A) over %d target layers", len(layers))
-            results = run_greedy_adversarial_rounding(model, layers, order, cached_layer_inputs, greedy_cfg, device)
+            results = run_greedy_adversarial_rounding(model, layers, order, sensitivity_by_layer, greedy_cfg, device)
         elif method_id == "01b_layerwise_local":
             logger.info("capturing per-layer input activations over %d calibration batches", len(calibration_batches))
             cached_layer_inputs = capture_layer_input_activations(model, layers, calibration_batches, device)

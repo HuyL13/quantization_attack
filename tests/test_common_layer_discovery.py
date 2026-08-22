@@ -10,7 +10,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from types import SimpleNamespace
 
-from aq.activation_cache import capture_block_input_activations, capture_layer_input_activations
+from aq.activation_cache import (
+    capture_block_input_activations,
+    capture_layer_input_activations,
+    compute_layer_activation_sensitivity,
+)
 from aq.common import get_block_layer_groups, get_block_modules, get_transformer_linear_layers
 from aq.optimizer_core import compute_fp_reference_logits
 from aq.calibration_strategies import run_isolated, run_quantized_prefix
@@ -185,9 +189,9 @@ def test_method_1a_greedy_rounding_against_real_block_shaped_model():
     b = _fake_batches()
     originals = {name: mod.weight.detach().clone() for name, mod in l.items()}
 
-    cached = capture_layer_input_activations(m, l, b, device="cpu")
+    sensitivity_by_layer = compute_layer_activation_sensitivity(m, l, b, device="cpu")
     cfg = GreedyRoundingConfig(bits=4, group_size=128, flip_fraction=0.2)
-    results = run_greedy_adversarial_rounding(m, l, o, cached, cfg, device="cpu")
+    results = run_greedy_adversarial_rounding(m, l, o, sensitivity_by_layer, cfg, device="cpu")
 
     assert set(results.keys()) == set(o)
     for name, mod in l.items():

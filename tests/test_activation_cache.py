@@ -57,3 +57,26 @@ def test_activation_sensitivity_raises_on_empty_input():
 
     with pytest.raises(ValueError):
         activation_sensitivity([])
+
+
+def test_compute_layer_activation_sensitivity_matches_capture_then_manual(tiny_model, tiny_calibration_batches):
+    from aq.activation_cache import compute_layer_activation_sensitivity
+
+    layers = {"mid_layers.0": tiny_model.mid_layers[0], "mid_layers.1": tiny_model.mid_layers[1]}
+    streaming = compute_layer_activation_sensitivity(tiny_model, layers, tiny_calibration_batches, device="cpu")
+    captured = capture_layer_input_activations(tiny_model, layers, tiny_calibration_batches, device="cpu")
+
+    for name in layers:
+        expected = activation_sensitivity(captured[name])
+        assert torch.allclose(streaming[name], expected, atol=1e-5)
+
+
+def test_compute_layer_activation_sensitivity_never_retains_raw_tensors(tiny_model, tiny_calibration_batches):
+    # the whole point: no raw activation tensor should be reachable from the
+    # returned dict, only the aggregate per-channel statistic (a 1-D tensor).
+    from aq.activation_cache import compute_layer_activation_sensitivity
+
+    layers = {"mid_layers.0": tiny_model.mid_layers[0]}
+    result = compute_layer_activation_sensitivity(tiny_model, layers, tiny_calibration_batches, device="cpu")
+    assert result["mid_layers.0"].dim() == 1
+    assert result["mid_layers.0"].shape[0] == tiny_model.mid_layers[0].in_features

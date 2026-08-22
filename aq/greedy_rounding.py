@@ -91,10 +91,16 @@ def run_greedy_adversarial_rounding(
     model,
     layers: dict,
     order: list[str],
-    cached_layer_inputs: dict[str, list[torch.Tensor]],
+    sensitivity_by_layer: dict[str, torch.Tensor],
     cfg: GreedyRoundingConfig,
     device: str,
 ) -> dict[str, LayerOptimizationResult]:
+    """`sensitivity_by_layer` is each layer's per-input-feature mean-squared
+    activation (aq.activation_cache.compute_layer_activation_sensitivity is
+    the streaming way to get this without ever storing raw activations -
+    activation_sensitivity(cached_inputs) also works if the caller already
+    has raw cached tensors for some other reason, e.g. in tests).
+    """
     from aq.calibration_strategies import _commit
     from aq.metrics import cosine_similarity_flat, rounding_flip_ratio, weight_relative_distance
 
@@ -102,7 +108,7 @@ def run_greedy_adversarial_rounding(
     for name in order:
         module = layers[name]
         w_fp = module.weight.detach().clone()
-        sensitivity = activation_sensitivity(cached_layer_inputs[name])
+        sensitivity = sensitivity_by_layer[name]
 
         hard_weight, baseline_int, hard_int_after, rtn_state = _score_and_flip(w_fp, cfg, sensitivity)
 

@@ -90,6 +90,59 @@ def capture_block_input_activations(
     return captured
 
 
+@torch.no_grad()
+def compute_layer_activation_sensitivity(
+    model, layers: dict, calibration_batches: list[dict], device: str
+) -> dict[str, torch.Tensor]:
+    """Streaming variant for method 1A: it only ever needs the AGGREGATE
+    per-input-feature mean-squared activation (see activation_sensitivity
+    below), never the raw per-batch activation tensors themselves. Accumulates
+    sum-of-squares directly inside the hook and never retains a tensor past
+    the batch that produced it - unlike capture_layer_input_activations,
+    whose returned cache is sized for ALL layers x ALL calibration batches
+    simultaneously (needed by methods 1B/1C, which really do reconstruct
+    against those activations, but wildly wasteful for 1A, which only reads
+    a per-channel statistic off of them). Measured live: capturing raw
+    activations for all 224 target layers over 32 calibration batches grew
+    resident CPU memory past 130GB within minutes and was still climbing;
+    this streaming version never holds more than one batch's activation
+    per layer at a time.
+    """
+    sum_sq: dict[str, torch.Tensor] = {}
+    count: dict[str, int] = {name: 0 for name in layers}
+    handles = []
+
+    def make_hook(name):
+        def hook(_module, inputs):
+            x = inputs[0] if isinstance(inputs, tuple) else inputs
+            x_flat = x.reshape(-1, x.shape[-1]).float()
+            sq = x_flat.pow(2).sum(dim=0)
+            if name not in sum_sq:
+                sum_sq[name] = sq
+            else:
+                sum_sq[name] += sq
+            count[name] += x_flat.shape[0]
+
+        return hook
+
+    for name, module in layers.items():
+        handles.append(module.register_forward_pre_hook(make_hook(name)))
+
+    model.eval()
+    try:
+        for batch in calibration_batches:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
+            model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+    finally:
+        for h in handles:
+            h.remove()
+
+    return {name: sum_sq[name] / max(count[name], 1) for name in layers}
+
+
 def activation_sensitivity(cached_inputs: list[torch.Tensor]) -> torch.Tensor:
     """Per-input-feature mean squared activation (AWQ-style salience),
     computed from a layer's cached inputs. Shape: (in_features,). Used by

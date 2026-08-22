@@ -64,15 +64,15 @@ def test_score_and_flip_prefers_low_sensitivity_columns():
 
 
 def test_run_greedy_adversarial_rounding_commits_weights(tiny_model, tiny_calibration_batches):
-    from aq.activation_cache import capture_layer_input_activations
+    from aq.activation_cache import compute_layer_activation_sensitivity
 
     layers = {"mid_layers.0": tiny_model.mid_layers[0], "mid_layers.1": tiny_model.mid_layers[1]}
     order = list(layers.keys())
     originals = {name: mod.weight.detach().clone() for name, mod in layers.items()}
-    cached = capture_layer_input_activations(tiny_model, layers, tiny_calibration_batches, device="cpu")
+    sensitivity_by_layer = compute_layer_activation_sensitivity(tiny_model, layers, tiny_calibration_batches, device="cpu")
 
     cfg = GreedyRoundingConfig(bits=4, group_size=128, flip_fraction=0.2)
-    results = run_greedy_adversarial_rounding(tiny_model, layers, order, cached, cfg, device="cpu")
+    results = run_greedy_adversarial_rounding(tiny_model, layers, order, sensitivity_by_layer, cfg, device="cpu")
 
     assert set(results.keys()) == set(order)
     for name, mod in layers.items():
