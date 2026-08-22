@@ -95,6 +95,10 @@ def run_selective_quantization(
     from aq.calibration_strategies import _commit
     from aq.metrics import cosine_similarity_flat, rounding_flip_ratio, weight_relative_distance
 
+    # Commit and CPU-stage each layer's hard_weight immediately rather than
+    # holding all 224 layers' outputs on GPU at once (the same
+    # all-layers-resident-simultaneously OOM pattern discovered and fixed in
+    # method 1C's block-wise reconstruction).
     results: dict[str, LayerOptimizationResult] = {}
     for name in order:
         module = layers[name]
@@ -113,10 +117,14 @@ def run_selective_quantization(
             "final_loss": None,
             "num_steps": 0,
         }
+        _commit(module, hard_weight)
         results[name] = LayerOptimizationResult(
-            layer_name=name, quantizer=None, hard_weight=hard_weight, trace_rows=[], layer_metrics=layer_metrics
+            layer_name=name,
+            quantizer=None,
+            hard_weight=hard_weight.to("cpu"),
+            trace_rows=[],
+            layer_metrics=layer_metrics,
         )
-
-    for name in order:
-        _commit(layers[name], results[name].hard_weight.to(device))
+        del w_fp, hard_weight
+        torch.cuda.empty_cache()
     return results

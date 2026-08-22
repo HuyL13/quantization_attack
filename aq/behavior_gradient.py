@@ -62,8 +62,12 @@ def compute_behavior_and_utility_gradients(
     for m in modules:
         m.weight.requires_grad_(True)
 
-    grad_behavior_sum = {name: torch.zeros_like(m.weight, dtype=torch.float32) for name, m in layers.items()}
-    grad_utility_sum = {name: torch.zeros_like(m.weight, dtype=torch.float32) for name, m in layers.items()}
+    # Accumulators live on CPU: 224 layers' worth of fp32 full-weight-shaped
+    # buffers, TWICE (behavior + utility), would exceed a single A100 40GB's
+    # memory if kept resident on GPU alongside the model itself (discovered
+    # via an actual OOM at this exact allocation on the real 7B checkpoint).
+    grad_behavior_sum = {name: torch.zeros_like(m.weight, dtype=torch.float32, device="cpu") for name, m in layers.items()}
+    grad_utility_sum = {name: torch.zeros_like(m.weight, dtype=torch.float32, device="cpu") for name, m in layers.items()}
 
     model.eval()
     n = max(len(calibration_batches), 1)
@@ -81,7 +85,7 @@ def compute_behavior_and_utility_gradients(
         behavior_scalar.backward()
         for name, m in layers.items():
             if m.weight.grad is not None:
-                grad_behavior_sum[name] += m.weight.grad.detach().float()
+                grad_behavior_sum[name] += m.weight.grad.detach().float().to("cpu")
 
         for m in modules:
             if m.weight.grad is not None:
@@ -94,7 +98,7 @@ def compute_behavior_and_utility_gradients(
         utility_loss.backward()
         for name, m in layers.items():
             if m.weight.grad is not None:
-                grad_utility_sum[name] += m.weight.grad.detach().float()
+                grad_utility_sum[name] += m.weight.grad.detach().float().to("cpu")
 
     for m in modules:
         m.weight.grad = None
