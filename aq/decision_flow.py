@@ -23,15 +23,34 @@ from dataclasses import dataclass, field
 # live: 1D costs ~2.79s per optimization step per layer (a full-model
 # forward + checkpointed backward) - each lighter tier is only reached if
 # the one before it fails both the PPL and watermark gates.
+# Methods 02-04 (Joint Scale / Codebook / Sensitivity) were replaced by
+# three lighter, zero-training-loop general attacks (per
+# lightweight_if_sft_quantization_methods.md) that don't need any of
+# method 1's iterative rounding-relaxation machinery at all - each is a
+# single closed-form scoring + apply pass:
+#   02_margin_aware      - Method A: score weights by predicted
+#                          top1-vs-top2 margin change / predicted LM-loss
+#                          change (one gradient pass, no loop), far-round
+#                          the top-scoring fraction.
+#   03_fragile_channel   - Method B: same mechanism, using predicted
+#                          top1-log-probability change as the behavior
+#                          signal instead of margin.
+#   04_stochastic_rounding - Method C: no backprop at all - per-weight
+#                          random floor/ceil choice, optionally biased
+#                          toward the "far" grid point and/or weighted by
+#                          method 1A's activation-sensitivity statistic.
+# Order follows that doc's section 7 IF-SFT-specific priority (this whole
+# plan only ever tests IF-SFT): Margin-Aware -> Fragile-Channel ->
+# Stochastic, each still gated by the same PPL-then-watermark rule.
 METHOD_ORDER = [
     "00_rtn4",
     "01a_greedy_round",
     "01b_layerwise_local",
     "01c_blockwise_local",
     "01d_global_kl",
-    "02_adv_round_scale",
-    "03_adv_codebook",
-    "04_sensitivity_aware",
+    "02_margin_aware",
+    "03_fragile_channel",
+    "04_stochastic_rounding",
     "05_quantized_prefix",
     "06_block_wise",
     "07_periodic_refresh",
@@ -44,9 +63,9 @@ METHOD_LABELS = {
     "01b_layerwise_local": "Adversarial Rounding (1B: layer-wise local reconstruction)",
     "01c_blockwise_local": "Adversarial Rounding (1C: block-wise local reconstruction)",
     "01d_global_kl": "Adversarial Rounding (1D: global KL-guided)",
-    "02_adv_round_scale": "Joint Rounding + Scale",
-    "03_adv_codebook": "Non-Uniform Codebook",
-    "04_sensitivity_aware": "Sensitivity-Aware",
+    "02_margin_aware": "Margin-Aware Selective Quantization",
+    "03_fragile_channel": "Fragile-Channel Aggressive Quantization",
+    "04_stochastic_rounding": "Stochastic / Biased Rounding",
     "05_quantized_prefix": "Quantized-Prefix Calibration",
     "06_block_wise": "Block-Wise",
     "07_periodic_refresh": "Periodic Activation Refresh",

@@ -3,13 +3,9 @@ model:
 method:
   bits: 4
   group_size: 128
-  optimize_scale: true
-  use_codebook: false
-  use_sensitivity: false
-  lambda_distance: 0.1
-  steps: 10
-  lr: 0.01
-  batches_per_step: 4
+  variant: far_biased
+  far_bias: 0.3
+  seed: 0
   calib_batch_size: 4
   max_seq_len: 512
   max_new_tokens: 32

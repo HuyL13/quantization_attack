@@ -130,8 +130,18 @@ def test_run_strategy_dispatch_isolated_methods(monkeypatch):
     fp_ref = compute_fp_reference_logits(model, batches, device="cpu")
     cfg = AdversarialQuantConfig(bits=4, group_size=128, steps=2, lr=1e-2)
 
-    for method_id in ["01d_global_kl", "02_adv_round_scale", "03_adv_codebook", "04_sensitivity_aware"]:
-        # fresh model per method to avoid cross-method state leakage in this test
+    # 01d_global_kl is the only method_id _run_strategy still routes to
+    # run_isolated - optimize_scale/use_codebook/use_sensitivity are config
+    # flags run_isolated itself still supports (used by whatever custom
+    # config passes them), not tied to any one named method anymore since
+    # 02/03/04 were replaced by the lightweight A/B/C methods.
+    for optimize_scale, use_codebook, use_sensitivity in [
+        (False, False, False),
+        (True, False, False),
+        (False, True, False),
+        (False, False, True),
+    ]:
+        # fresh model per case to avoid cross-case state leakage in this test
         m = FakeCausalLM(n_layers=2)
         l = get_transformer_linear_layers(m)
         o = list(l.keys())
@@ -143,12 +153,12 @@ def test_run_strategy_dispatch_isolated_methods(monkeypatch):
             group_size=128,
             steps=2,
             lr=1e-2,
-            optimize_scale=(method_id == "02_adv_round_scale"),
-            use_codebook=(method_id == "03_adv_codebook"),
+            optimize_scale=optimize_scale,
+            use_codebook=use_codebook,
             n_codebook_centroids=8,
-            use_sensitivity=(method_id == "04_sensitivity_aware"),
+            use_sensitivity=use_sensitivity,
         )
-        results = _run_strategy(method_id, m, l, o, bg, b, ref, cfg2, "cpu")
+        results = _run_strategy("01d_global_kl", m, l, o, bg, b, ref, cfg2, "cpu")
         assert set(results.keys()) == set(o)
         out = m(input_ids=b[0]["input_ids"])
         assert torch.isfinite(out.logits).all()
@@ -230,5 +240,63 @@ def test_method_1c_blockwise_local_against_real_block_shaped_model():
     results = run_blockwise_local_reconstruction(block_groups, l, block_modules, cached_block_inputs, cfg, device="cpu")
 
     assert set(results.keys()) == set(l.keys())
+    out = m(input_ids=b[0]["input_ids"])
+    assert torch.isfinite(out.logits).all()
+
+
+def test_method_margin_aware_against_real_block_shaped_model():
+    from aq.behavior_gradient import compute_behavior_and_utility_gradients
+    from aq.selective_quantization import SelectiveQuantConfig, run_selective_quantization
+
+    m = FakeCausalLM(n_layers=2)
+    l = get_transformer_linear_layers(m)
+    o = list(l.keys())
+    b = _fake_batches()
+    originals = {name: mod.weight.detach().clone() for name, mod in l.items()}
+
+    grad_by_layer = compute_behavior_and_utility_gradients(m, l, b, device="cpu", behavior="margin")
+    cfg = SelectiveQuantConfig(bits=4, group_size=128, aggressive_fraction=0.1)
+    results = run_selective_quantization(l, o, grad_by_layer, cfg, device="cpu")
+
+    assert set(results.keys()) == set(o)
+    for name, mod in l.items():
+        assert not torch.equal(mod.weight.detach(), originals[name])
+    out = m(input_ids=b[0]["input_ids"])
+    assert torch.isfinite(out.logits).all()
+
+
+def test_method_fragile_channel_against_real_block_shaped_model():
+    from aq.behavior_gradient import compute_behavior_and_utility_gradients
+    from aq.selective_quantization import SelectiveQuantConfig, run_selective_quantization
+
+    m = FakeCausalLM(n_layers=2)
+    l = get_transformer_linear_layers(m)
+    o = list(l.keys())
+    b = _fake_batches()
+
+    grad_by_layer = compute_behavior_and_utility_gradients(m, l, b, device="cpu", behavior="top1_logprob")
+    cfg = SelectiveQuantConfig(bits=4, group_size=128, aggressive_fraction=0.1)
+    results = run_selective_quantization(l, o, grad_by_layer, cfg, device="cpu")
+
+    assert set(results.keys()) == set(o)
+    out = m(input_ids=b[0]["input_ids"])
+    assert torch.isfinite(out.logits).all()
+
+
+def test_method_stochastic_rounding_against_real_block_shaped_model():
+    from aq.stochastic_rounding import StochasticRoundingConfig, run_stochastic_rounding
+
+    m = FakeCausalLM(n_layers=2)
+    l = get_transformer_linear_layers(m)
+    o = list(l.keys())
+    b = _fake_batches()
+    originals = {name: mod.weight.detach().clone() for name, mod in l.items()}
+
+    cfg = StochasticRoundingConfig(bits=4, group_size=128, variant="far_biased", far_bias=0.3)
+    results = run_stochastic_rounding(l, o, None, cfg, device="cpu")
+
+    assert set(results.keys()) == set(o)
+    for name, mod in l.items():
+        assert torch.equal(mod.weight.detach(), results[name].hard_weight)
     out = m(input_ids=b[0]["input_ids"])
     assert torch.isfinite(out.logits).all()

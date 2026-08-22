@@ -47,10 +47,10 @@ Monitor a running method:
 tail -f results/runs/<method_id>/run.log
 ```
 
-To re-run a single method (e.g. after tuning `configs/03_adv_codebook.yaml`):
+To re-run a single method (e.g. after tuning `configs/03_fragile_channel.yaml`):
 
 ```bash
-python -m aq.run_method --method 03_adv_codebook --config configs/03_adv_codebook.yaml \
+python -m aq.run_method --method 03_fragile_channel --config configs/03_fragile_channel.yaml \
     --rtn4-ppl <value from results/runs/00_rtn4/ppl_result.json> --output results
 ```
 

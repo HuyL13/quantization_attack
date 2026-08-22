@@ -47,9 +47,12 @@ from aq.activation_cache import (
     capture_layer_input_activations,
     compute_layer_activation_sensitivity,
 )
+from aq.behavior_gradient import compute_behavior_and_utility_gradients
 from aq.decision_flow import GateConfig, MethodOutcome, STATUS_PASS, decide_next_action
 from aq.greedy_rounding import GreedyRoundingConfig, run_greedy_adversarial_rounding
 from aq.local_reconstruction import run_blockwise_local_reconstruction, run_layerwise_local_reconstruction
+from aq.selective_quantization import SelectiveQuantConfig, run_selective_quantization
+from aq.stochastic_rounding import StochasticRoundingConfig, run_stochastic_rounding
 from aq.logging_utils import (
     get_run_logger,
     run_dir_for,
@@ -66,13 +69,21 @@ from aq.quantizer import AdversarialQuantConfig
 from aq.reporting import generate_method_report
 from aq.rtn_backend import rtn_quantize_weight_raw
 
-# Methods 1A/1B/1C never run the full 32-layer model during optimization
-# (1A is gradient-free; 1B/1C optimize against cached LOCAL activations) -
-# so they skip gradient checkpointing / model.train() (nothing to
-# checkpoint) and the expensive full-model fp_reference_logits cache (no
-# global KL term at all). Every other method (1D and 02-08) is a full-model
-# global-KL method and needs both.
-LOCAL_METHODS = {"01a_greedy_round", "01b_layerwise_local", "01c_blockwise_local"}
+# Methods 1A/1B/1C/04 never run the full 32-layer model during optimization
+# (1A and 04 are gradient-free; 1B/1C optimize against cached LOCAL
+# activations) - so they skip gradient checkpointing / model.train()
+# (nothing to checkpoint) and the expensive full-model fp_reference_logits
+# cache (no global KL term at all).
+LOCAL_METHODS = {"01a_greedy_round", "01b_layerwise_local", "01c_blockwise_local", "04_stochastic_rounding"}
+
+# 02/03 need a full-model backward (to score every weight's predicted
+# behavior/utility impact) but - unlike 1D/05-08 - only a HANDFUL of
+# calibration batches, once, with no iterative optimization loop at all.
+# They still need gradient checkpointing (a full-depth backward is a
+# full-depth backward regardless of whether it repeats), so they're full-
+# model methods for that purpose, but they use their own dedicated code
+# path (aq.selective_quantization), not the old iterative _run_strategy.
+GRADIENT_SCORING_METHODS = {"02_margin_aware", "03_fragile_channel"}
 
 
 def _apply_rtn4_baseline(layers: dict) -> None:
@@ -86,7 +97,7 @@ def _apply_rtn4_baseline(layers: dict) -> None:
 
 
 def _run_strategy(method_id: str, model, layers: dict, order, block_groups, calibration_batches, fp_ref, cfg, device):
-    if method_id in ("01d_global_kl", "02_adv_round_scale", "03_adv_codebook", "04_sensitivity_aware"):
+    if method_id == "01d_global_kl":
         return run_isolated(model, layers, order, calibration_batches, fp_ref, cfg, device)
     if method_id == "05_quantized_prefix":
         return run_quantized_prefix(model, layers, order, calibration_batches, fp_ref, cfg, device)
@@ -202,7 +213,7 @@ def run_one_method(
             )
             logger.info("running layer-wise local reconstruction (1B) over %d target layers", len(layers))
             results = run_layerwise_local_reconstruction(layers, order, cached_layer_inputs, cfg, device)
-        else:  # 01c_blockwise_local
+        elif method_id == "01c_blockwise_local":
             block_modules = get_block_modules(model)
             block_module_map = {str(i): m for i, m in enumerate(block_modules)}
             logger.info("capturing per-block input activations over %d calibration batches", len(calibration_batches))
@@ -223,7 +234,61 @@ def run_one_method(
             results = run_blockwise_local_reconstruction(
                 block_groups, layers, block_modules, cached_block_inputs, cfg, device
             )
+        else:  # 04_stochastic_rounding - no backprop, no repeated forward at all
+            stoch_cfg = StochasticRoundingConfig(
+                bits=method_cfg.get("bits", 4),
+                group_size=method_cfg.get("group_size", 128),
+                variant=method_cfg.get("variant", "far_biased"),
+                far_bias=method_cfg.get("far_bias", 0.3),
+                seed=method_cfg.get("seed", 0),
+            )
+            sensitivity_by_layer = None
+            if stoch_cfg.variant == "fragility_weighted":
+                logger.info(
+                    "computing streaming activation sensitivity over %d calibration batches", len(calibration_batches)
+                )
+                sensitivity_by_layer = compute_layer_activation_sensitivity(model, layers, calibration_batches, device)
+            logger.info(
+                "running stochastic/biased rounding (method C, variant=%s) over %d target layers",
+                stoch_cfg.variant,
+                len(layers),
+            )
+            results = run_stochastic_rounding(layers, order, sensitivity_by_layer, stoch_cfg, device)
 
+        for name in order:
+            if name in results:
+                all_layer_metrics.append(results[name].layer_metrics)
+                all_trace_rows.extend(results[name].trace_rows)
+    elif method_id in GRADIENT_SCORING_METHODS:
+        calibration_texts = load_calibration_texts(method_cfg.get("calibration_path", default_calibration_path()))
+        # A full-model backward pass needs the same memory care as the old
+        # heavy tier's per-step forward - cap the sample count for the same
+        # reason 1B/1C do (a handful of calibration batches is standard for
+        # this kind of one-shot gradient-based scoring, e.g. OBD/OBS-style
+        # saliency estimation).
+        calibration_texts = calibration_texts[: method_cfg.get("calibration_samples", 16)]
+        calibration_batches = build_calibration_batches(
+            tokenizer,
+            calibration_texts,
+            max_seq_len=method_cfg.get("max_seq_len", 512),
+            batch_size=method_cfg.get("calib_batch_size", 4),
+            device=device,
+        )
+        behavior = "margin" if method_id == "02_margin_aware" else "top1_logprob"
+        model.train()
+        logger.info(
+            "computing %s/utility gradients over %d calibration batches", behavior, len(calibration_batches)
+        )
+        grad_by_layer = compute_behavior_and_utility_gradients(model, layers, calibration_batches, device, behavior)
+        model.eval()
+
+        select_cfg = SelectiveQuantConfig(
+            bits=method_cfg.get("bits", 4),
+            group_size=method_cfg.get("group_size", 128),
+            aggressive_fraction=method_cfg.get("aggressive_fraction", 0.05),
+        )
+        logger.info("running selective quantization (%s) over %d target layers", method_id, len(layers))
+        results = run_selective_quantization(layers, order, grad_by_layer, select_cfg, device)
         for name in order:
             if name in results:
                 all_layer_metrics.append(results[name].layer_metrics)
@@ -345,7 +410,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--method", required=True, choices=[
         "00_rtn4", "01a_greedy_round", "01b_layerwise_local", "01c_blockwise_local", "01d_global_kl",
-        "02_adv_round_scale", "03_adv_codebook", "04_sensitivity_aware",
+        "02_margin_aware", "03_fragile_channel", "04_stochastic_rounding",
         "05_quantized_prefix", "06_block_wise", "07_periodic_refresh", "08_two_pass_backward",
     ])
     ap.add_argument("--config", required=True, help="YAML with model/method sections")
