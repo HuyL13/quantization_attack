@@ -67,3 +67,8 @@ def test_run_blockwise_local_reconstruction_commits(tiny_model, tiny_calibration
         assert torch.equal(mod.weight.detach(), results[name].hard_weight)
         assert results[name].quantizer is None
         assert len(results[name].trace_rows) == cfg.steps
+        # staged on CPU after commit - keeping a duplicate GPU copy of every
+        # already-committed layer's weight (on top of what's already live in
+        # module.weight.data) grew unboundedly across all 32 real blocks and
+        # was enough to OOM a 40GB A100 mid-run.
+        assert results[name].hard_weight.device.type == "cpu"

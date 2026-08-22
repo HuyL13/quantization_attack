@@ -230,6 +230,18 @@ def run_blockwise_local_reconstruction(
             results[name] = result
             _commit(module, hard_w)
             _release_quantizer(result)
+            # hard_w is already written into module.weight.data by _commit -
+            # keeping the separate GPU copy in result.hard_weight for every
+            # processed layer across all 32 blocks duplicates a growing
+            # fraction of the whole model's weights a second time over on
+            # GPU (up to ~13.5GB by the last block) - measured live: this
+            # was enough to push a 40GB A100 into OOM mid-run even after
+            # fixing per-layer quantizer buffers and adding periodic
+            # empty_cache(). Stage it on CPU; nothing after this point reads
+            # it back except aggregate reporting.
+            result.hard_weight = result.hard_weight.to("cpu")
         quantizers.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     return results
