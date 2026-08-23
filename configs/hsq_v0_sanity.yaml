@@ -1,0 +1,22 @@
+# Quick timing/correctness sanity check (guide section 20) - only the first
+# 2 transformer blocks get quantized, the rest of the model stays FP. Use
+# this to (a) measure real per-block wall-clock time before committing to a
+# full run, and (b) eyeball that layer_metrics.csv / the report look sane.
+# NOT a valid method outcome - most of the model is untouched.
+model:
+  id: cnut1648/LLaMA2-7B-fingerprinted-SFT
+method:
+  bits: 4
+  group_size: 128
+  sym: false
+  percdamp: 0.01
+  blocksize: 128
+  tau: 0.02
+  candidate_radius: 2
+  max_blocks: 2
+  calibration_samples: 8
+  calib_batch_size: 4
+  max_seq_len: 512
+  max_new_tokens: 32
+  max_ppl_relative_regression: 0.05
+  max_fsr_exact_for_pass: 0.0

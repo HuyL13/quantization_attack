@@ -123,3 +123,53 @@ same budget the Phase A AWQ/GPTQ runs already used successfully on this
 box. `06_block_wise` is the one method that optimizes several matrices at
 once (a full transformer block, ~7 matrices), which is still small
 relative to the full model.
+
+## HSQ (Hessian-Slack Quantization) - a separate GPTQ-family pipeline
+
+`aq/run_hsq.py` implements a different quantization objective from the
+adversarial-quant plan above: instead of REWARDING weight distance while
+trying to preserve KL, HSQ still MINIMIZES the same second-order loss
+surrogate GPTQ uses, but searches for the FARTHEST lattice point whose
+predicted Hessian-weighted loss stays within a budget relative to GPTQ's
+own nearest-rounding solution:
+
+    GPTQ:  min_q  e^T H e
+    HSQ:   max_q  D(e)   s.t.  e^T H e <= (1+tau) * L_GPTQ
+
+Three `--method` values in `aq/run_hsq.py` (`gptq4`, `hsq_v0`, `hsq_v1`)
+share one GPTQ-style sequential block-traversal driver - blocks are
+quantized in depth order and each block's calibration inputs are captured
+by running the calibration set through the model AS IT CURRENTLY STANDS
+(earlier blocks already quantized in place), the same activation
+propagation GPTQ's own driver relies on. `hsq_v0` budgets per-coordinate
+against that coordinate's own GPTQ-nearest cost; `hsq_v1` budgets
+cumulatively per group against a real prior GPTQ (nearest-only) pass over
+that same group (two passes per layer) - `aq/hsq_core.py`'s module
+docstring has the full derivation-to-code mapping.
+
+```bash
+python -m aq.run_method --method 00_rtn4 --config configs/00_rtn4.yaml --output results   # baseline, if not already run
+bash scripts/run_hsq.sh   # runs a 2-block timing sanity check, then gptq4 -> hsq_v0 -> hsq_v1
+```
+
+Tune `configs/gptq4.yaml` / `configs/hsq_v0.yaml` / `configs/hsq_v1.yaml`
+(`tau`, `candidate_radius`, `percdamp`, `blocksize`, `group_size`). Env
+vars for `scripts/run_hsq.sh`: `OUTPUT`, `SKIP_SANITY=1` (skip the timing
+check), `STOP_ON_PASS=1` (stop after the first watermark PASS),
+`FORCE_WATERMARK_EVAL=1` (evaluate watermark even on PPL-gate failures,
+diagnostic only), `METHODS_OVERRIDE="hsq_v0 hsq_v1"` (subset/reorder).
+
+**Sanity checks before trusting a result** (mandatory per the HSQ design
+doc): with `tau=0`, `hsq_v0`/`hsq_v1` must produce weights identical to
+`gptq4` (`tests/test_hsq_core.py::test_hsq_v0_with_zero_tau_matches_gptq_nearest_choice`
+checks this on synthetic data) - if a real run's `hsq_v0` config with a
+tiny `tau` looks wildly different from `gptq4`, something's wrong before
+you even look at PPL. `configs/hsq_v0_sanity.yaml` (`max_blocks: 2`) is for
+timing only, never a real result.
+
+**No CPU/GPU-real-checkpoint test coverage yet** beyond what's listed
+above - `tests/test_hsq_quantizer.py`, `tests/test_hsq_hessian.py`,
+`tests/test_hsq_core.py`, `tests/test_run_hsq.py` all run on synthetic
+tensors / a tiny fake HF-shaped model, same caveat as the rest of this
+repo: actual PPL/watermark numbers on the real 7B model only come from a
+run on the rented box.
