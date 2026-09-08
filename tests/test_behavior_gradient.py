@@ -51,6 +51,22 @@ def test_restores_requires_grad_and_clears_grad(tiny_model, tiny_calibration_bat
     assert tiny_model.mid_layers[0].weight.grad is None
 
 
+def test_preserves_training_mode_for_gradient_checkpointing(tiny_model, tiny_calibration_batches):
+    layers = {"mid_layers.0": tiny_model.mid_layers[0]}
+    tiny_model.train()
+    compute_behavior_and_utility_gradients(tiny_model, layers, tiny_calibration_batches, device="cpu")
+    assert tiny_model.training is True
+
+
+def test_non_target_parameters_do_not_keep_gradients(tiny_model, tiny_calibration_batches):
+    layers = {"mid_layers.0": tiny_model.mid_layers[0]}
+    non_target = tiny_model.mid_layers[1].weight
+    assert non_target.requires_grad is True
+    compute_behavior_and_utility_gradients(tiny_model, layers, tiny_calibration_batches, device="cpu")
+    assert non_target.requires_grad is True
+    assert non_target.grad is None
+
+
 def test_margin_gradient_matches_manual_two_class_case():
     # Build a minimal linear model over a 2-class vocabulary (real integer
     # token ids, one-hot embedded) where the margin (top1-top2 logit gap)

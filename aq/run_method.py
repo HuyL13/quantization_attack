@@ -151,6 +151,8 @@ def run_one_method(
         # Methods 1A-1C never run the full model during optimization (see
         # LOCAL_METHODS), so none of this applies to them.
         model.gradient_checkpointing_enable()
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
         model.config.use_cache = False
 
     layers = get_transformer_linear_layers(model)

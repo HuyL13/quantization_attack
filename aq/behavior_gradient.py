@@ -26,6 +26,8 @@ calibration batches, once.
 """
 from __future__ import annotations
 
+import gc
+
 import torch
 import torch.nn.functional as F
 
@@ -58,18 +60,21 @@ def compute_behavior_and_utility_gradients(
     W_FP, never touch it based on this gradient).
     """
     modules = list(layers.values())
-    had_grad = [m.weight.requires_grad for m in modules]
+    target_weight_ids = {id(m.weight) for m in modules}
+    all_params = list(model.parameters())
+    had_param_grad = [p.requires_grad for p in all_params]
+    for p in all_params:
+        p.requires_grad_(id(p) in target_weight_ids)
     for m in modules:
         m.weight.requires_grad_(True)
 
-    # Accumulators live on CPU: 224 layers' worth of fp32 full-weight-shaped
-    # buffers, TWICE (behavior + utility), would exceed a single A100 40GB's
-    # memory if kept resident on GPU alongside the model itself (discovered
-    # via an actual OOM at this exact allocation on the real 7B checkpoint).
-    grad_behavior_sum = {name: torch.zeros_like(m.weight, dtype=torch.float32, device="cpu") for name, m in layers.items()}
-    grad_utility_sum = {name: torch.zeros_like(m.weight, dtype=torch.float32, device="cpu") for name, m in layers.items()}
+    # Accumulators live on CPU and use bf16 to keep the all-layer gradient
+    # cache small enough for Colab/A100 host RAM. Scoring converts each layer
+    # back to fp32 only when that layer is selected and quantized.
+    accum_dtype = torch.bfloat16
+    grad_behavior_sum = {name: torch.zeros_like(m.weight, dtype=accum_dtype, device="cpu") for name, m in layers.items()}
+    grad_utility_sum = {name: torch.zeros_like(m.weight, dtype=accum_dtype, device="cpu") for name, m in layers.items()}
 
-    model.eval()
     n = max(len(calibration_batches), 1)
     for batch in calibration_batches:
         input_ids = batch["input_ids"].to(device)
@@ -77,19 +82,18 @@ def compute_behavior_and_utility_gradients(
         if attention_mask is not None:
             attention_mask = attention_mask.to(device)
 
-        for m in modules:
-            if m.weight.grad is not None:
-                m.weight.grad = None
+        model.zero_grad(set_to_none=True)
         out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
         behavior_scalar = _behavior_scalar(out.logits, behavior)
         behavior_scalar.backward()
         for name, m in layers.items():
             if m.weight.grad is not None:
-                grad_behavior_sum[name] += m.weight.grad.detach().float().to("cpu")
+                grad_behavior_sum[name] += m.weight.grad.detach().to(device="cpu", dtype=accum_dtype)
+        del out, behavior_scalar
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-        for m in modules:
-            if m.weight.grad is not None:
-                m.weight.grad = None
+        model.zero_grad(set_to_none=True)
         out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
         utility_loss = F.cross_entropy(
             out.logits[:, :-1, :].reshape(-1, out.logits.shape[-1]).float(),
@@ -98,11 +102,14 @@ def compute_behavior_and_utility_gradients(
         utility_loss.backward()
         for name, m in layers.items():
             if m.weight.grad is not None:
-                grad_utility_sum[name] += m.weight.grad.detach().float().to("cpu")
+                grad_utility_sum[name] += m.weight.grad.detach().to(device="cpu", dtype=accum_dtype)
+        del out, utility_loss, input_ids, attention_mask
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    for m in modules:
-        m.weight.grad = None
-    for m, orig in zip(modules, had_grad):
-        m.weight.requires_grad_(orig)
+    model.zero_grad(set_to_none=True)
+    for p, orig in zip(all_params, had_param_grad):
+        p.requires_grad_(orig)
 
     return {name: (grad_behavior_sum[name] / n, grad_utility_sum[name] / n) for name in layers}
