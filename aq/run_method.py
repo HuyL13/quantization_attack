@@ -64,6 +64,7 @@ from aq.logging_utils import (
     write_watermark_result_json,
 )
 from aq.optimizer_core import compute_fp_reference_logits
+from aq.ppl_eval import compute_wikitext2_ppl
 from aq.plotting import plot_kl_vs_distance_trace, plot_rounding_flip_ratio_per_layer
 from aq.quantizer import AdversarialQuantConfig
 from aq.reporting import generate_method_report
@@ -124,7 +125,6 @@ def run_one_method(
     force_watermark_eval: bool = False,
 ) -> MethodOutcome:
     ensure_if_awq_tier0_on_path()
-    from src.eval_wikitext import compute_wikitext2_ppl
     from src.verify_fingerprint import run_verification, summarize
 
     run_dir = run_dir_for(out_root, method_id)

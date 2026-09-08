@@ -55,6 +55,7 @@ from aq.logging_utils import (
     write_watermark_result_json,
 )
 from aq.metrics import cosine_similarity_flat, weight_relative_distance
+from aq.ppl_eval import compute_wikitext2_ppl
 from aq.plotting import plot_rounding_flip_ratio_per_layer
 from aq.reporting import generate_method_report
 
@@ -156,7 +157,6 @@ def run_hsq_method(
     import torch
 
     ensure_if_awq_tier0_on_path()
-    from src.eval_wikitext import compute_wikitext2_ppl
     from src.verify_fingerprint import run_verification, summarize
 
     assert method_id in HSQ_METHODS, f"unknown HSQ method {method_id!r}"

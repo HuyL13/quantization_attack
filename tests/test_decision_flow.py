@@ -49,6 +49,31 @@ def test_decide_next_action_fails_utility_before_watermark_needed():
     assert outcome.watermark_fsr_exact is None
 
 
+def test_fragile_channel_skips_ppl_gate_but_records_regression_before_watermark():
+    cfg = GateConfig(max_ppl_relative_regression=0.05)
+    outcome = decide_next_action("03_fragile_channel", candidate_ppl=12.0, rtn4_ppl=10.0, gate_cfg=cfg)
+    assert outcome.status == STATUS_SKIPPED
+    assert outcome.ppl == 12.0
+    assert outcome.rtn4_ppl == 10.0
+    assert outcome.ppl_relative_regression == pytest.approx(0.2)
+    assert outcome.watermark_fsr_exact is None
+
+
+def test_fragile_channel_final_decision_uses_watermark_even_when_ppl_regresses():
+    cfg = GateConfig(max_ppl_relative_regression=0.05, max_fsr_exact_for_pass=0.0)
+    outcome = decide_next_action(
+        "03_fragile_channel",
+        candidate_ppl=12.0,
+        rtn4_ppl=10.0,
+        gate_cfg=cfg,
+        watermark_fsr_exact=0.0,
+        watermark_fsr_contains=0.0,
+    )
+    assert outcome.status == STATUS_PASS
+    assert outcome.ppl_relative_regression == pytest.approx(0.2)
+    assert outcome.watermark_fsr_exact == 0.0
+
+
 def test_decide_next_action_skipped_when_ppl_ok_and_watermark_not_yet_run():
     cfg = GateConfig(max_ppl_relative_regression=0.05)
     outcome = decide_next_action("01_adv_round", candidate_ppl=10.1, rtn4_ppl=10.0, gate_cfg=cfg)

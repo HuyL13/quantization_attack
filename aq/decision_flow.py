@@ -77,6 +77,8 @@ STATUS_FAIL_UTILITY = "FAIL_UTILITY"
 STATUS_FAIL_WATERMARK_RETAINED = "FAIL_WATERMARK_RETAINED"
 STATUS_SKIPPED = "SKIPPED"
 
+PPL_GATE_BYPASS_METHODS = {"03_fragile_channel"}
+
 
 @dataclass
 class GateConfig:
@@ -138,10 +140,15 @@ def decide_next_action(
     gate is evaluated (i.e. run this BEFORE the watermark eval to decide
     whether to run it at all - matches plan section 12's ordering, which
     saves an expensive watermark eval on a method that already failed on
-    utility grounds).
+    utility grounds). Methods in `PPL_GATE_BYPASS_METHODS` still record PPL
+    and relative regression, but do not let the PPL gate stop watermark eval.
     """
     ppl_ok, relative_regression, ppl_detail = evaluate_ppl_gate(candidate_ppl, rtn4_ppl, gate_cfg)
-    if not ppl_ok:
+    bypass_ppl_gate = method_id in PPL_GATE_BYPASS_METHODS
+    if bypass_ppl_gate:
+        ppl_detail += " | PPL gate bypassed for method"
+
+    if not ppl_ok and not bypass_ppl_gate:
         return MethodOutcome(
             method_id=method_id,
             status=STATUS_FAIL_UTILITY,
