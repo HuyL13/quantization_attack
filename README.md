@@ -8,8 +8,8 @@ stop-early gate (PPL vs RTN4 -> watermark FSR), sharing one core objective
 
 which REWARDS large weight distance while trying to keep behavior (KL)
 close to the FP parent. Reuses `if_awq_tier0`'s RTN grid
-(`AWQQuantizerXL.quantize_weight_groupwise_raw`), WikiText-2 PPL evaluator,
-and IF-SFT watermark verification verbatim - nothing there is reimplemented.
+(`AWQQuantizerXL.quantize_weight_groupwise_raw`) and IF-SFT watermark
+verification. WikiText-2 PPL follows the block evaluator in `aq/ppl_eval.py`.
 
 ## Layout
 
@@ -47,16 +47,23 @@ Monitor a running method:
 tail -f results/runs/<method_id>/run.log
 ```
 
-To re-run a single method (e.g. after tuning `configs/03_fragile_channel.yaml`):
+To run the replacement Method 3 once:
 
 ```bash
-python -m aq.run_method --method 03_fragile_channel --config configs/03_fragile_channel.yaml \
-    --rtn4-ppl <value from results/runs/00_rtn4/ppl_result.json> --output results
+python -m aq.run_method --method 03_global_far_round --config configs/03_global_far_round.yaml \
+    --rtn4-ppl <value from results/runs/00_rtn4/ppl_result.json> --output results \
+    --force-watermark-eval
 ```
+
+Method 3 now ranks the fragility score across all target projections with
+one CPU histogram threshold. Run the required seven-point reproduction sweep
+with `bash scripts/run_global_far_round_sweep.sh`; results are written under
+`results_global_far_round/`, including CSV/JSON/Markdown summaries and the
+PPL-FSR curve.
 
 ## Testing
 
-All 64 tests run on CPU with no GPU and no real 7B checkpoint (synthetic
+All tests run on CPU with no GPU and no real 7B checkpoint (synthetic
 tiny linear layers / a fake HF-shaped model stand in for the real model):
 
 ```bash

@@ -4,9 +4,14 @@ method:
   bits: 4
   group_size: 128
   aggressive_fraction: 0.05
+  eps: 1.0e-8
   calibration_samples: 16
   calib_batch_size: 4
   max_seq_len: 512
+  behavior: top1_logprob
+  selection_scope: global
+  threshold_mode: histogram
+  histogram_bins: 65536
   max_new_tokens: 32
   max_ppl_relative_regression: 0.05
   max_fsr_exact_for_pass: 0.0

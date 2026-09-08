@@ -1,5 +1,5 @@
 """Shared gradient computation for methods A (Margin-Aware) and B
-(Fragile-Channel): a SINGLE (or few) full-model forward+backward pass over
+(Global Far-Round): a SINGLE (or few) full-model forward+backward pass over
 calibration data gives, for every target weight simultaneously, the
 gradient of a "behavior" scalar and a "utility" scalar - no per-channel
 trial-and-error forward pass, no iterative optimization loop. This is a

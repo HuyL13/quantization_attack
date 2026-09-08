@@ -17,7 +17,7 @@ DTYPE="${DTYPE:-bfloat16}"
 CONFIG_DIR="${CONFIG_DIR:-$ROOT/configs}"
 
 METHODS=(00_rtn4 01a_greedy_round 01b_layerwise_local 01c_blockwise_local 01d_global_kl \
-         02_margin_aware 03_fragile_channel 04_stochastic_rounding \
+         02_margin_aware 03_global_far_round 04_stochastic_rounding \
          05_quantized_prefix 06_block_wise 07_periodic_refresh 08_two_pass_backward)
 
 mkdir -p "$OUTPUT"

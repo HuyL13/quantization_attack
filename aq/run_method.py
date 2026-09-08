@@ -4,13 +4,14 @@ section 13 requires. Intended to be called repeatedly (00_rtn4, 01_..., ...)
 by scripts/run_all_methods.sh, which stops the loop as soon as one method
 returns PASS.
 
-Reuses if_awq_tier0's WikiText-2 PPL evaluator and IF-SFT watermark
-verification verbatim - this file only wires them into the adversarial
-quantization + gating pipeline.
+Reuses if_awq_tier0's IF-SFT watermark verifier and RTN backend. WikiText-2
+PPL is evaluated by aq.ppl_eval using the block protocol shared with the
+local eval_ppl.py reference.
 """
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import time
 from pathlib import Path
@@ -24,6 +25,7 @@ from aq.common import (
     ensure_dir,
     ensure_if_awq_tier0_on_path,
     free_model,
+    cpu_peak_memory_bytes,
     get_block_layer_groups,
     get_block_modules,
     get_transformer_linear_layers,
@@ -50,6 +52,7 @@ from aq.activation_cache import (
 from aq.behavior_gradient import compute_behavior_and_utility_gradients
 from aq.decision_flow import GateConfig, MethodOutcome, STATUS_PASS, decide_next_action, evaluate_watermark_gate
 from aq.greedy_rounding import GreedyRoundingConfig, run_greedy_adversarial_rounding
+from aq.global_far_round import GlobalFarRoundConfig, run_global_far_round
 from aq.local_reconstruction import run_blockwise_local_reconstruction, run_layerwise_local_reconstruction
 from aq.selective_quantization import SelectiveQuantConfig, run_selective_quantization
 from aq.stochastic_rounding import StochasticRoundingConfig, run_stochastic_rounding
@@ -65,7 +68,7 @@ from aq.logging_utils import (
 )
 from aq.optimizer_core import compute_fp_reference_logits
 from aq.ppl_eval import compute_wikitext2_ppl
-from aq.plotting import plot_kl_vs_distance_trace, plot_rounding_flip_ratio_per_layer
+from aq.plotting import plot_global_far_round_selection, plot_kl_vs_distance_trace, plot_rounding_flip_ratio_per_layer
 from aq.quantizer import AdversarialQuantConfig
 from aq.reporting import generate_method_report
 from aq.rtn_backend import rtn_quantize_weight_raw
@@ -84,7 +87,7 @@ LOCAL_METHODS = {"01a_greedy_round", "01b_layerwise_local", "01c_blockwise_local
 # full-depth backward regardless of whether it repeats), so they're full-
 # model methods for that purpose, but they use their own dedicated code
 # path (aq.selective_quantization), not the old iterative _run_strategy.
-GRADIENT_SCORING_METHODS = {"02_margin_aware", "03_fragile_channel"}
+GRADIENT_SCORING_METHODS = {"02_margin_aware", "03_global_far_round"}
 
 
 def _apply_rtn4_baseline(layers: dict) -> None:
@@ -162,6 +165,7 @@ def run_one_method(
     t0 = time.time()
     all_layer_metrics: list[dict] = []
     all_trace_rows: list[dict] = []
+    method_metrics: dict = {}
 
     if method_id == "00_rtn4":
         logger.info("applying RTN4 baseline to %d layers", len(layers))
@@ -277,25 +281,61 @@ def run_one_method(
             batch_size=method_cfg.get("calib_batch_size", 4),
             device=device,
         )
-        behavior = "margin" if method_id == "02_margin_aware" else "top1_logprob"
+        default_behavior = "margin" if method_id == "02_margin_aware" else "top1_logprob"
+        behavior = method_cfg.get("behavior", default_behavior)
         model.train()
         logger.info(
             "computing %s/utility gradients over %d calibration batches", behavior, len(calibration_batches)
         )
+        gradient_start = time.time()
         grad_by_layer = compute_behavior_and_utility_gradients(model, layers, calibration_batches, device, behavior)
+        method_metrics["gradient_time"] = time.time() - gradient_start
         model.eval()
 
-        select_cfg = SelectiveQuantConfig(
-            bits=method_cfg.get("bits", 4),
-            group_size=method_cfg.get("group_size", 128),
-            aggressive_fraction=method_cfg.get("aggressive_fraction", 0.05),
-        )
-        logger.info("running selective quantization (%s) over %d target layers", method_id, len(layers))
-        results = run_selective_quantization(layers, order, grad_by_layer, select_cfg, device)
+        if method_id == "03_global_far_round":
+            global_cfg = GlobalFarRoundConfig(
+                bits=method_cfg.get("bits", 4),
+                group_size=method_cfg.get("group_size", 128),
+                aggressive_fraction=method_cfg.get("aggressive_fraction", 0.05),
+                eps=method_cfg.get("eps", 1e-8),
+                behavior=method_cfg.get("behavior", "top1_logprob"),
+                threshold_mode=method_cfg.get("threshold_mode", "histogram"),
+                histogram_bins=method_cfg.get("histogram_bins", 65536),
+            )
+            logger.info("running global far-round over %d target layers", len(layers))
+            global_result = run_global_far_round(layers, order, grad_by_layer, global_cfg, device)
+            results = global_result.layer_results
+            method_metrics.update(global_result.global_metrics)
+            logger.info(
+                "global threshold=%.8g selected=%d/%d (%.4f%%) flip_ratio=%.4f%% checksum=%s",
+                global_result.global_metrics["global_threshold"],
+                global_result.global_metrics["global_num_selected"],
+                global_result.global_metrics["global_num_weights"],
+                100.0 * global_result.global_metrics["actual_selected_fraction"],
+                100.0 * global_result.global_metrics["actual_rounding_flip_ratio"],
+                global_result.global_metrics["selection_mask_checksum"],
+            )
+        else:
+            select_cfg = SelectiveQuantConfig(
+                bits=method_cfg.get("bits", 4),
+                group_size=method_cfg.get("group_size", 128),
+                aggressive_fraction=method_cfg.get("aggressive_fraction", 0.05),
+                eps=method_cfg.get("eps", 1e-8),
+            )
+            logger.info("running selective quantization (%s) over %d target layers", method_id, len(layers))
+            results = run_selective_quantization(layers, order, grad_by_layer, select_cfg, device)
         for name in order:
             if name in results:
                 all_layer_metrics.append(results[name].layer_metrics)
                 all_trace_rows.extend(results[name].trace_rows)
+        del results, grad_by_layer, calibration_batches, calibration_texts
+        if method_id == "03_global_far_round":
+            del global_result
+        gc.collect()
+        if device.startswith("cuda"):
+            import torch
+
+            torch.cuda.empty_cache()
     else:
         cfg = AdversarialQuantConfig(
             bits=method_cfg.get("bits", 4),
@@ -350,11 +390,21 @@ def run_one_method(
         plot_kl_vs_distance_trace(all_trace_rows, run_dir / "kl_vs_distance.png", title=method_id)
     if all_layer_metrics:
         plot_rounding_flip_ratio_per_layer(all_layer_metrics, run_dir / "rounding_flip_ratio.png", title=method_id)
+    if method_id == "03_global_far_round" and all_layer_metrics:
+        plot_global_far_round_selection(all_layer_metrics, run_dir)
 
     logger.info("computing WikiText-2 PPL")
+    ppl_start = time.time()
     ppl_result = compute_wikitext2_ppl(model, tokenizer, device=device)
+    ppl_time = time.time() - ppl_start
     write_ppl_result_json(run_dir, ppl_result)
     candidate_ppl = ppl_result["wikitext2_ppl"]
+    method_metrics.update({
+        "ppl": candidate_ppl,
+        "ppl_delta_abs": candidate_ppl - rtn4_ppl if method_id != "00_rtn4" else 0.0,
+        "ppl_relative_regression": (candidate_ppl - rtn4_ppl) / rtn4_ppl if method_id != "00_rtn4" else 0.0,
+        "ppl_time": ppl_time,
+    })
 
     gate_cfg = GateConfig(
         max_ppl_relative_regression=method_cfg.get("max_ppl_relative_regression", 0.05),
@@ -388,6 +438,9 @@ def run_one_method(
                 device=device,
             )
             watermark_summary = summarize(per_key, evaluation_time_seconds=time.time() - t1)
+            method_metrics["watermark_time"] = time.time() - t1
+            method_metrics["fsr_exact"] = watermark_summary["fsr_exact"]
+            method_metrics["fsr_contains"] = watermark_summary["fsr_contains"]
             write_watermark_result_json(run_dir, {"summary": watermark_summary, "per_key": per_key})
             watermark_gone, watermark_detail = evaluate_watermark_gate(watermark_summary["fsr_exact"], gate_cfg)
             if pre_gate.status == "SKIPPED":
@@ -415,8 +468,10 @@ def run_one_method(
         "method_id": method_id,
         "ppl": candidate_ppl,
         "peak_gpu_memory_bytes": gpu_peak_memory_bytes(),
+        "peak_cpu_memory_bytes": cpu_peak_memory_bytes(),
         "elapsed_seconds": elapsed,
         "num_layers_touched": len(layers) if method_id != "00_rtn4" else len(layers),
+        **method_metrics,
     }
     outcome.model_metrics = model_metrics
     write_model_metrics_json(run_dir, model_metrics)
@@ -431,7 +486,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--method", required=True, choices=[
         "00_rtn4", "01a_greedy_round", "01b_layerwise_local", "01c_blockwise_local", "01d_global_kl",
-        "02_margin_aware", "03_fragile_channel", "04_stochastic_rounding",
+        "02_margin_aware", "03_global_far_round", "04_stochastic_rounding",
         "05_quantized_prefix", "06_block_wise", "07_periodic_refresh", "08_two_pass_backward",
     ])
     ap.add_argument("--config", required=True, help="YAML with model/method sections")
@@ -439,6 +494,7 @@ def main() -> None:
     ap.add_argument("--output", required=True)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    ap.add_argument("--aggressive-fraction", type=float, default=None, help="Override method.aggressive_fraction")
     ap.add_argument(
         "--force-watermark-eval",
         action="store_true",
@@ -449,6 +505,8 @@ def main() -> None:
 
     configure_gpu_performance()
     cfg = load_yaml_config(args.config)
+    if args.aggressive_fraction is not None:
+        cfg.setdefault("method", {})["aggressive_fraction"] = args.aggressive_fraction
     out_root = ensure_dir(Path(args.output))
 
     rtn4_ppl = args.rtn4_ppl

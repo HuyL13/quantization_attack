@@ -106,4 +106,4 @@ def test_margin_gradient_matches_manual_two_class_case():
     # by-hand derivation): mean margin over both positions -> this exact
     # gradient.
     expected = torch.tensor([[0.5, -0.5], [-0.5, 0.5]])
-    assert torch.allclose(grad_behavior, expected, atol=1e-5)
+    assert torch.allclose(grad_behavior.float(), expected, atol=1e-5)

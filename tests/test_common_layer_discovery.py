@@ -265,9 +265,9 @@ def test_method_margin_aware_against_real_block_shaped_model():
     assert torch.isfinite(out.logits).all()
 
 
-def test_method_fragile_channel_against_real_block_shaped_model():
+def test_method_global_far_round_against_real_block_shaped_model():
     from aq.behavior_gradient import compute_behavior_and_utility_gradients
-    from aq.selective_quantization import SelectiveQuantConfig, run_selective_quantization
+    from aq.global_far_round import GlobalFarRoundConfig, run_global_far_round
 
     m = FakeCausalLM(n_layers=2)
     l = get_transformer_linear_layers(m)
@@ -275,10 +275,10 @@ def test_method_fragile_channel_against_real_block_shaped_model():
     b = _fake_batches()
 
     grad_by_layer = compute_behavior_and_utility_gradients(m, l, b, device="cpu", behavior="top1_logprob")
-    cfg = SelectiveQuantConfig(bits=4, group_size=128, aggressive_fraction=0.1)
-    results = run_selective_quantization(l, o, grad_by_layer, cfg, device="cpu")
+    cfg = GlobalFarRoundConfig(bits=4, group_size=128, aggressive_fraction=0.1, histogram_bins=128)
+    result = run_global_far_round(l, o, grad_by_layer, cfg, device="cpu")
 
-    assert set(results.keys()) == set(o)
+    assert set(result.layer_results.keys()) == set(o)
     out = m(input_ids=b[0]["input_ids"])
     assert torch.isfinite(out.logits).all()
 

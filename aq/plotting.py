@@ -79,3 +79,53 @@ def plot_rounding_flip_ratio_per_layer(layer_metrics_rows: list[dict], out_path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=120)
     plt.close(fig)
+
+
+def plot_global_far_round_selection(layer_metrics_rows: list[dict], run_dir: Path) -> None:
+    fractions = [float(row["selected_fraction"]) for row in layer_metrics_rows]
+    fig, ax = plt.subplots(figsize=(max(7, len(fractions) * 0.12), 4))
+    ax.plot(range(len(fractions)), fractions, linewidth=1)
+    ax.set_xlabel("target layer index")
+    ax.set_ylabel("selected fraction")
+    ax.set_title("Global far-round selection by layer")
+    fig.tight_layout()
+    fig.savefig(run_dir / "selected_fraction_by_layer.png", dpi=120)
+    plt.close(fig)
+
+    by_projection: dict[str, list[tuple[int, int]]] = {}
+    for row in layer_metrics_rows:
+        by_projection.setdefault(row["projection_type"], []).append(
+            (int(row["num_selected"]), int(row["num_weights"]))
+        )
+    projections = sorted(by_projection)
+    projection_fractions = [
+        sum(selected for selected, _ in by_projection[name])
+        / max(sum(valid for _, valid in by_projection[name]), 1)
+        for name in projections
+    ]
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.bar(projections, projection_fractions)
+    ax.set_ylabel("selected fraction")
+    ax.set_title("Global far-round selection by projection")
+    plt.xticks(rotation=30, ha="right")
+    fig.tight_layout()
+    fig.savefig(run_dir / "selected_fraction_by_projection.png", dpi=120)
+    plt.close(fig)
+
+
+def plot_global_far_round_ppl_fsr(rows: list[dict], out_path: Path) -> None:
+    evaluated = [row for row in rows if row.get("fsr_exact") is not None]
+    if not evaluated:
+        return
+    x = [100.0 * float(row["ppl_relative_regression"]) for row in evaluated]
+    y = [float(row["fsr_exact"]) for row in evaluated]
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(x, y, marker="o")
+    for row, x_value, y_value in zip(evaluated, x, y):
+        ax.annotate(f"rho={row['rho']:g}", (x_value, y_value), fontsize=8)
+    ax.set_xlabel("PPL relative regression (%)")
+    ax.set_ylabel("FSR exact")
+    ax.set_title("Global far-round PPL-FSR curve")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)

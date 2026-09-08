@@ -32,15 +32,15 @@ from dataclasses import dataclass, field
 #                          top1-vs-top2 margin change / predicted LM-loss
 #                          change (one gradient pass, no loop), far-round
 #                          the top-scoring fraction.
-#   03_fragile_channel   - Method B: same mechanism, using predicted
-#                          top1-log-probability change as the behavior
-#                          signal instead of margin.
+#   03_global_far_round  - Method B: rank the same top1-logprob/utility
+#                          score across the whole model, then far-round one
+#                          global top fraction.
 #   04_stochastic_rounding - Method C: no backprop at all - per-weight
 #                          random floor/ceil choice, optionally biased
 #                          toward the "far" grid point and/or weighted by
 #                          method 1A's activation-sensitivity statistic.
 # Order follows that doc's section 7 IF-SFT-specific priority (this whole
-# plan only ever tests IF-SFT): Margin-Aware -> Fragile-Channel ->
+# plan only ever tests IF-SFT): Margin-Aware -> Global Far-Round ->
 # Stochastic, each still gated by the same PPL-then-watermark rule.
 METHOD_ORDER = [
     "00_rtn4",
@@ -49,7 +49,7 @@ METHOD_ORDER = [
     "01c_blockwise_local",
     "01d_global_kl",
     "02_margin_aware",
-    "03_fragile_channel",
+    "03_global_far_round",
     "04_stochastic_rounding",
     "05_quantized_prefix",
     "06_block_wise",
@@ -64,7 +64,7 @@ METHOD_LABELS = {
     "01c_blockwise_local": "Adversarial Rounding (1C: block-wise local reconstruction)",
     "01d_global_kl": "Adversarial Rounding (1D: global KL-guided)",
     "02_margin_aware": "Margin-Aware Selective Quantization",
-    "03_fragile_channel": "Fragile-Channel Aggressive Quantization",
+    "03_global_far_round": "Global Fragility-Scored Far-Round Quantization",
     "04_stochastic_rounding": "Stochastic / Biased Rounding",
     "05_quantized_prefix": "Quantized-Prefix Calibration",
     "06_block_wise": "Block-Wise",
@@ -77,7 +77,7 @@ STATUS_FAIL_UTILITY = "FAIL_UTILITY"
 STATUS_FAIL_WATERMARK_RETAINED = "FAIL_WATERMARK_RETAINED"
 STATUS_SKIPPED = "SKIPPED"
 
-PPL_GATE_BYPASS_METHODS = {"03_fragile_channel"}
+PPL_GATE_BYPASS_METHODS = {"03_global_far_round"}
 
 
 @dataclass

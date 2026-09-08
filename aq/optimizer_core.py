@@ -31,7 +31,7 @@ from aq.sensitivity import estimate_weight_sensitivity
 class LayerOptimizationResult:
     layer_name: str
     quantizer: AdversarialLinearQuantizer
-    hard_weight: torch.Tensor
+    hard_weight: torch.Tensor | None
     trace_rows: list[dict]
     layer_metrics: dict
 

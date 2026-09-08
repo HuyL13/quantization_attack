@@ -4,6 +4,8 @@ section 15/16 (summary table + the plan's 8 analytical questions).
 from __future__ import annotations
 
 from pathlib import Path
+import csv
+import json
 
 from aq.decision_flow import METHOD_LABELS, MethodOutcome, STATUS_PASS
 
@@ -102,3 +104,66 @@ def generate_final_comparison(outcomes: list[MethodOutcome], out_path: Path) -> 
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def generate_global_far_round_sweep_report(root: Path) -> dict:
+    """Aggregate completed rho runs and identify the requested FSR transitions."""
+    rows = []
+    for metrics_path in root.glob("rho_*/runs/03_global_far_round/model_metrics.json"):
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        rows.append({
+            "rho": float(metrics["target_aggressive_fraction"]),
+            "selected_fraction": metrics.get("actual_selected_fraction"),
+            "flip_ratio": metrics.get("actual_rounding_flip_ratio"),
+            "ppl": metrics.get("ppl"),
+            "ppl_relative_regression": metrics.get("ppl_relative_regression"),
+            "fsr_exact": metrics.get("fsr_exact"),
+            "fsr_contains": metrics.get("fsr_contains"),
+        })
+    rows.sort(key=lambda row: row["rho"])
+    if not rows:
+        raise ValueError(f"no completed global far-round runs found under {root}")
+
+    def first_rho(predicate):
+        match = next((row for row in rows if row["fsr_exact"] is not None and predicate(row)), None)
+        return match["rho"] if match else None
+
+    zero_rows = [row for row in rows if row["fsr_exact"] == 0.0]
+    lowest_ppl_zero = min(zero_rows, key=lambda row: row["ppl"]) if zero_rows else None
+    summary = {
+        "first_rho_with_fsr_below_1": first_rho(lambda row: row["fsr_exact"] < 1.0),
+        "first_rho_with_fsr_at_most_0_125": first_rho(lambda row: row["fsr_exact"] <= 0.125),
+        "first_rho_with_fsr_zero": first_rho(lambda row: row["fsr_exact"] == 0.0),
+        "lowest_ppl_rho_with_fsr_zero": lowest_ppl_zero["rho"] if lowest_ppl_zero else None,
+        "runs": rows,
+    }
+    fields = list(rows[0])
+    with open(root / "global_far_round_sweep.csv", "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    lines = [
+        "# Global Far-Round Sweep",
+        "",
+        "| rho | selected% | flip% | PPL | ΔPPL% | FSR exact | FSR contains |",
+        "|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in rows:
+        lines.append(
+            f"| {row['rho']:.3f} | {_fmt(100.0 * row['selected_fraction'])} | "
+            f"{_fmt(100.0 * row['flip_ratio'])} | {_fmt(row['ppl'])} | "
+            f"{_fmt(100.0 * row['ppl_relative_regression'])} | "
+            f"{_fmt(row['fsr_exact'])} | {_fmt(row['fsr_contains'])} |"
+        )
+    lines += [
+        "",
+        f"- First rho with FSR < 1: {_fmt(summary['first_rho_with_fsr_below_1'])}",
+        f"- First rho with FSR <= 0.125: {_fmt(summary['first_rho_with_fsr_at_most_0_125'])}",
+        f"- First rho with FSR = 0: {_fmt(summary['first_rho_with_fsr_zero'])}",
+        f"- Lowest-PPL rho with FSR = 0: {_fmt(summary['lowest_ppl_rho_with_fsr_zero'])}",
+    ]
+    (root / "global_far_round_sweep.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (root / "global_far_round_sweep.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    from aq.plotting import plot_global_far_round_ppl_fsr
+    plot_global_far_round_ppl_fsr(rows, root / "global_far_round_ppl_fsr.png")
+    return summary

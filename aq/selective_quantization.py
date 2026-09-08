@@ -1,4 +1,4 @@
-"""Methods A (Margin-Aware) and B (Fragile-Channel) Selective Quantization -
+"""Method A (Margin-Aware) per-layer Selective Quantization -
 zero-training, one-shot: score every weight by
 
     S_i = |predicted behavior delta_i| / (|predicted utility delta_i| + eps)

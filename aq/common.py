@@ -135,6 +135,48 @@ def gpu_peak_memory_bytes() -> int | None:
     return None
 
 
+def cpu_peak_memory_bytes() -> int | None:
+    """Return this process' peak resident set size in bytes when available."""
+    try:
+        import resource
+
+        peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        # Linux reports KiB; macOS reports bytes.
+        return peak if sys.platform == "darwin" else peak * 1024
+    except (ImportError, OSError, ValueError):
+        pass
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class ProcessMemoryCounters(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            counters = ProcessMemoryCounters()
+            counters.cb = ctypes.sizeof(counters)
+            process = ctypes.windll.kernel32.GetCurrentProcess()
+            ok = ctypes.windll.psapi.GetProcessMemoryInfo(
+                process, ctypes.byref(counters), counters.cb
+            )
+            return int(counters.PeakWorkingSetSize) if ok else None
+        except (AttributeError, OSError, ValueError):
+            return None
+    return None
+
+
 def get_transformer_linear_layers(model) -> "dict[str, Any]":
     """name -> nn.Linear for every projection inside model.model.layers[*]
     (q/k/v/o + gate/up/down), in depth order. lm_head/embeddings excluded -
