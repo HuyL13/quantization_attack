@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+import aq.global_far_round as global_far_round
 from aq.global_far_round import GlobalFarRoundConfig, get_near_far_candidates, run_global_far_round
 
 
@@ -9,6 +10,24 @@ def _linear(weight):
     with torch.no_grad():
         layer.weight.copy_(weight)
     return layer
+
+
+def test_score_quantiles_bound_the_number_of_values_given_to_torch_quantile(monkeypatch):
+    observed_sizes = []
+    real_quantile = torch.quantile
+
+    def guarded_quantile(values, quantiles):
+        observed_sizes.append(values.numel())
+        if values.numel() > 128:
+            raise RuntimeError("quantile() input tensor is too large")
+        return real_quantile(values, quantiles)
+
+    monkeypatch.setattr(torch, "quantile", guarded_quantile)
+    result = global_far_round._score_quantiles(torch.arange(10_000.0), max_samples=128)
+
+    assert observed_sizes == [128]
+    assert result.shape == (4,)
+    assert torch.all(result[1:] >= result[:-1])
 
 
 def test_global_budget_is_not_reapplied_per_layer():

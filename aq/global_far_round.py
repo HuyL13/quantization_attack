@@ -42,6 +42,31 @@ class GlobalFarRoundResult:
     global_metrics: dict
 
 
+def _score_quantiles(values: torch.Tensor, max_samples: int = 1_000_000) -> torch.Tensor:
+    """Return diagnostic quantiles without passing a full 7B layer to quantile.
+
+    PyTorch rejects very large inputs to ``torch.quantile``.  These values are
+    report-only diagnostics, so use a deterministic, evenly spaced sample and
+    compute its quantiles on CPU.  Selection still uses every score.
+    """
+    flat = values.detach().reshape(-1)
+    if flat.numel() == 0:
+        return torch.zeros(4, dtype=torch.float32)
+    if max_samples < 1:
+        raise ValueError("max_samples must be at least 1")
+    if flat.numel() > max_samples:
+        indices = torch.linspace(
+            0,
+            flat.numel() - 1,
+            steps=max_samples,
+            device=flat.device,
+            dtype=torch.float64,
+        ).to(dtype=torch.long)
+        flat = flat.index_select(0, indices)
+    flat = flat.to(device="cpu", dtype=torch.float32)
+    return torch.quantile(flat, torch.tensor([0.5, 0.9, 0.95, 0.99]))
+
+
 def get_near_far_candidates(w_fp: torch.Tensor, bits: int = 4, group_size: int = 128):
     state = rtn_quantize_weight_raw(w_fp, bits=bits, group_size=group_size)
     floor_value = torch.floor(state.pre_round)
@@ -196,7 +221,7 @@ def run_global_far_round(
         n_valid = int(real_valid.sum())
         n_selected = int(real_selected.sum())
         n_flipped = int(real_flips.sum())
-        quantiles = torch.quantile(real_score, torch.tensor([0.5, 0.9, 0.95, 0.99], device=real_score.device)) if n_valid else torch.zeros(4)
+        quantiles = _score_quantiles(real_score)
         checksum.update(real_selected.to(device="cpu", dtype=torch.uint8).numpy().tobytes())
 
         metrics = {
