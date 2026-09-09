@@ -1,0 +1,6 @@
+model:
+  id: cnut1648/LLaMA2-7B-fingerprinted-SFT
+method:
+  bits: 3
+  group_size: 128
+  max_new_tokens: 32

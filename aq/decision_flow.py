@@ -58,6 +58,7 @@ METHOD_ORDER = [
 ]
 
 METHOD_LABELS = {
+    "00_rtn3": "RTN3 diagnostic baseline",
     "00_rtn4": "RTN4 baseline",
     "01a_greedy_round": "Adversarial Rounding (1A: greedy, zero-training)",
     "01b_layerwise_local": "Adversarial Rounding (1B: layer-wise local reconstruction)",

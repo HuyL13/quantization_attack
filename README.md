@@ -55,6 +55,13 @@ python -m aq.run_method --method 03_global_far_round --config configs/03_global_
     --force-watermark-eval
 ```
 
+To evaluate the standalone RTN3 diagnostic with both WikiText-2 PPL and
+watermark FSR (no PPL gate):
+
+```bash
+OUTPUT=./results_rtn3 bash scripts/run_rtn3.sh
+```
+
 Method 3 now ranks the fragility score across all target projections with
 one CPU histogram threshold. Run the required seven-point reproduction sweep
 with `bash scripts/run_global_far_round_sweep.sh`; results are written under

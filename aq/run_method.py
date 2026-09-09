@@ -80,6 +80,24 @@ from aq.rtn_backend import rtn_quantize_weight_raw
 # cache (no global KL term at all).
 LOCAL_METHODS = {"01a_greedy_round", "01b_layerwise_local", "01c_blockwise_local", "04_stochastic_rounding"}
 
+RTN_BASELINE_BITS = {"00_rtn3": 3, "00_rtn4": 4}
+
+METHOD_CHOICES = [
+    "00_rtn3",
+    "00_rtn4",
+    "01a_greedy_round",
+    "01b_layerwise_local",
+    "01c_blockwise_local",
+    "01d_global_kl",
+    "02_margin_aware",
+    "03_global_far_round",
+    "04_stochastic_rounding",
+    "05_quantized_prefix",
+    "06_block_wise",
+    "07_periodic_refresh",
+    "08_two_pass_backward",
+]
+
 # 02/03 need a full-model backward (to score every weight's predicted
 # behavior/utility impact) but - unlike 1D/05-08 - only a HANDFUL of
 # calibration batches, once, with no iterative optimization loop at all.
@@ -90,14 +108,19 @@ LOCAL_METHODS = {"01a_greedy_round", "01b_layerwise_local", "01c_blockwise_local
 GRADIENT_SCORING_METHODS = {"02_margin_aware", "03_global_far_round"}
 
 
-def _apply_rtn4_baseline(layers: dict) -> None:
+def _apply_rtn_baseline(layers: dict, bits: int, group_size: int = 128) -> None:
     import torch
 
-    for name, module in layers.items():
+    for module in layers.values():
         w = module.weight.detach().clone()
-        state = rtn_quantize_weight_raw(w, bits=4, group_size=128)
+        state = rtn_quantize_weight_raw(w, bits=bits, group_size=group_size)
         with torch.no_grad():
             module.weight.data.copy_(state.dequantize_truncated().to(module.weight.dtype))
+
+
+def _apply_rtn4_baseline(layers: dict) -> None:
+    """Backward-compatible wrapper for the mandatory RTN4 reference."""
+    _apply_rtn_baseline(layers, bits=4, group_size=128)
 
 
 def _run_strategy(method_id: str, model, layers: dict, order, block_groups, calibration_batches, fp_ref, cfg, device):
@@ -121,7 +144,7 @@ def run_one_method(
     method_id: str,
     model_cfg: dict,
     method_cfg: dict,
-    rtn4_ppl: float,
+    rtn4_ppl: float | None,
     out_root: Path,
     device: str = "cuda",
     dtype: str = "bfloat16",
@@ -139,7 +162,7 @@ def run_one_method(
     model = load_causal_lm(model_id, device=device, dtype=dtype)
     tokenizer = load_tokenizer(model_id)
 
-    is_full_model_method = method_id != "00_rtn4" and method_id not in LOCAL_METHODS
+    is_full_model_method = method_id not in RTN_BASELINE_BITS and method_id not in LOCAL_METHODS
     if is_full_model_method:
         # Every full-model method backprops from the loss through however
         # many of the model's 32 decoder blocks sit between the patched
@@ -167,9 +190,21 @@ def run_one_method(
     all_trace_rows: list[dict] = []
     method_metrics: dict = {}
 
-    if method_id == "00_rtn4":
-        logger.info("applying RTN4 baseline to %d layers", len(layers))
-        _apply_rtn4_baseline(layers)
+    if method_id in RTN_BASELINE_BITS:
+        bits = method_cfg.get("bits", RTN_BASELINE_BITS[method_id])
+        group_size = method_cfg.get("group_size", 128)
+        if bits != RTN_BASELINE_BITS[method_id]:
+            raise ValueError(
+                f"{method_id} requires bits={RTN_BASELINE_BITS[method_id]}, got {bits}"
+            )
+        logger.info(
+            "applying RTN%d baseline to %d layers (group_size=%d)",
+            bits,
+            len(layers),
+            group_size,
+        )
+        _apply_rtn_baseline(layers, bits=bits, group_size=group_size)
+        method_metrics.update({"bits": bits, "group_size": group_size})
     elif method_id in LOCAL_METHODS:
         calibration_texts = load_calibration_texts(method_cfg.get("calibration_path", default_calibration_path()))
         if method_id in ("01b_layerwise_local", "01c_blockwise_local"):
@@ -399,10 +434,19 @@ def run_one_method(
     ppl_time = time.time() - ppl_start
     write_ppl_result_json(run_dir, ppl_result)
     candidate_ppl = ppl_result["wikitext2_ppl"]
+    if method_id == "00_rtn4":
+        ppl_delta_abs = 0.0
+        ppl_relative_regression = 0.0
+    elif rtn4_ppl is None:
+        ppl_delta_abs = None
+        ppl_relative_regression = None
+    else:
+        ppl_delta_abs = candidate_ppl - rtn4_ppl
+        ppl_relative_regression = ppl_delta_abs / rtn4_ppl
     method_metrics.update({
         "ppl": candidate_ppl,
-        "ppl_delta_abs": candidate_ppl - rtn4_ppl if method_id != "00_rtn4" else 0.0,
-        "ppl_relative_regression": (candidate_ppl - rtn4_ppl) / rtn4_ppl if method_id != "00_rtn4" else 0.0,
+        "ppl_delta_abs": ppl_delta_abs,
+        "ppl_relative_regression": ppl_relative_regression,
         "ppl_time": ppl_time,
     })
 
@@ -411,10 +455,44 @@ def run_one_method(
         max_fsr_exact_for_pass=method_cfg.get("max_fsr_exact_for_pass", 0.0),
     )
 
+    def evaluate_and_write_watermark() -> dict:
+        fingerprints = read_json(method_cfg.get("fingerprint_keys_path", default_fingerprint_keys_path()))
+        logger.info("running watermark verification (%d keys)", len(fingerprints))
+        watermark_start = time.time()
+        per_key = run_verification(
+            model,
+            tokenizer,
+            fingerprints,
+            do_sample=False,
+            max_new_tokens=method_cfg.get("max_new_tokens", 32),
+            device=device,
+        )
+        watermark_time = time.time() - watermark_start
+        watermark_summary = summarize(per_key, evaluation_time_seconds=watermark_time)
+        method_metrics["watermark_time"] = watermark_time
+        method_metrics["fsr_exact"] = watermark_summary["fsr_exact"]
+        method_metrics["fsr_contains"] = watermark_summary["fsr_contains"]
+        write_watermark_result_json(run_dir, {"summary": watermark_summary, "per_key": per_key})
+        return watermark_summary
+
     if method_id == "00_rtn4":
         # RTN4 is the fixed reference point, never gated against itself.
         outcome = MethodOutcome(method_id=method_id, status="BASELINE", ppl=candidate_ppl, rtn4_ppl=candidate_ppl)
+    elif method_id == "00_rtn3":
+        # RTN3 is a standalone diagnostic baseline and always reports FSR.
+        watermark_summary = evaluate_and_write_watermark()
+        outcome = MethodOutcome(
+            method_id=method_id,
+            status="EVALUATED",
+            ppl=candidate_ppl,
+            rtn4_ppl=rtn4_ppl,
+            ppl_relative_regression=ppl_relative_regression,
+            watermark_fsr_exact=watermark_summary["fsr_exact"],
+            watermark_fsr_contains=watermark_summary["fsr_contains"],
+            detail="RTN3 PPL and watermark evaluated without gates",
+        )
     else:
+        assert rtn4_ppl is not None
         pre_gate = decide_next_action(method_id, candidate_ppl, rtn4_ppl, gate_cfg)
         if pre_gate.status != "SKIPPED" and not force_watermark_eval:
             outcome = pre_gate
@@ -426,22 +504,7 @@ def run_one_method(
                     "for diagnostic purposes only (this outcome is NOT a real PASS candidate)",
                     pre_gate.detail,
                 )
-            fingerprints = read_json(method_cfg.get("fingerprint_keys_path", default_fingerprint_keys_path()))
-            logger.info("running watermark verification (%d keys)", len(fingerprints))
-            t1 = time.time()
-            per_key = run_verification(
-                model,
-                tokenizer,
-                fingerprints,
-                do_sample=False,
-                max_new_tokens=method_cfg.get("max_new_tokens", 32),
-                device=device,
-            )
-            watermark_summary = summarize(per_key, evaluation_time_seconds=time.time() - t1)
-            method_metrics["watermark_time"] = time.time() - t1
-            method_metrics["fsr_exact"] = watermark_summary["fsr_exact"]
-            method_metrics["fsr_contains"] = watermark_summary["fsr_contains"]
-            write_watermark_result_json(run_dir, {"summary": watermark_summary, "per_key": per_key})
+            watermark_summary = evaluate_and_write_watermark()
             watermark_gone, watermark_detail = evaluate_watermark_gate(watermark_summary["fsr_exact"], gate_cfg)
             if pre_gate.status == "SKIPPED":
                 # Normal path: PPL gate passed, watermark result is the real gate.
@@ -484,11 +547,7 @@ def run_one_method(
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--method", required=True, choices=[
-        "00_rtn4", "01a_greedy_round", "01b_layerwise_local", "01c_blockwise_local", "01d_global_kl",
-        "02_margin_aware", "03_global_far_round", "04_stochastic_rounding",
-        "05_quantized_prefix", "06_block_wise", "07_periodic_refresh", "08_two_pass_backward",
-    ])
+    ap.add_argument("--method", required=True, choices=METHOD_CHOICES)
     ap.add_argument("--config", required=True, help="YAML with model/method sections")
     ap.add_argument("--rtn4-ppl", type=float, default=None, help="Baseline PPL from the 00_rtn4 run (required for methods 01-08)")
     ap.add_argument("--output", required=True)
@@ -511,8 +570,8 @@ def main() -> None:
 
     rtn4_ppl = args.rtn4_ppl
     if rtn4_ppl is None:
-        if args.method == "00_rtn4":
-            rtn4_ppl = float("nan")
+        if args.method in RTN_BASELINE_BITS:
+            rtn4_ppl = None
         else:
             baseline_path = out_root / "runs" / "00_rtn4" / "ppl_result.json"
             if not baseline_path.exists():

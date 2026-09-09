@@ -8,6 +8,7 @@ available in this environment.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import sys
 from types import SimpleNamespace
 
 from aq.activation_cache import (
@@ -21,7 +22,8 @@ from aq.calibration_strategies import run_isolated, run_quantized_prefix
 from aq.greedy_rounding import GreedyRoundingConfig, run_greedy_adversarial_rounding
 from aq.local_reconstruction import run_blockwise_local_reconstruction, run_layerwise_local_reconstruction
 from aq.quantizer import AdversarialQuantConfig
-from aq.run_method import _apply_rtn4_baseline, _run_strategy
+import aq.run_method as run_method
+from aq.run_method import _apply_rtn4_baseline, _apply_rtn_baseline, _run_strategy
 
 
 class FakeAttn(nn.Module):
@@ -281,6 +283,72 @@ def test_method_global_far_round_against_real_block_shaped_model():
     assert set(result.layer_results.keys()) == set(o)
     out = m(input_ids=b[0]["input_ids"])
     assert torch.isfinite(out.logits).all()
+
+
+def test_apply_rtn3_baseline_passes_three_bits_to_the_shared_backend(monkeypatch):
+    model = FakeCausalLM(n_layers=1)
+    layers = get_transformer_linear_layers(model)
+    observed_bits = []
+
+    class FakeState:
+        def __init__(self, weight):
+            self.weight = weight
+
+        def dequantize_truncated(self):
+            return self.weight + 1
+
+    def fake_quantize(weight, bits, group_size):
+        observed_bits.append((bits, group_size))
+        return FakeState(weight)
+
+    monkeypatch.setattr(run_method, "rtn_quantize_weight_raw", fake_quantize)
+    _apply_rtn_baseline(layers, bits=3, group_size=128)
+
+    assert observed_bits == [(3, 128)] * len(layers)
+
+
+def test_rtn3_is_a_registered_standalone_evaluation_method():
+    assert run_method.RTN_BASELINE_BITS["00_rtn3"] == 3
+    assert "00_rtn3" in run_method.METHOD_CHOICES
+
+
+def test_rtn3_cli_does_not_require_an_rtn4_ppl(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_run_one_method(method_id, model_cfg, method_cfg, rtn4_ppl, out_root, **kwargs):
+        captured.update(method_id=method_id, rtn4_ppl=rtn4_ppl, out_root=out_root)
+        return run_method.MethodOutcome(method_id=method_id, status="EVALUATED")
+
+    monkeypatch.setattr(run_method, "configure_gpu_performance", lambda: None)
+    monkeypatch.setattr(
+        run_method,
+        "load_yaml_config",
+        lambda path: {"model": {"id": "fake"}, "method": {"bits": 3}},
+    )
+    monkeypatch.setattr(run_method, "run_one_method", fake_run_one_method)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_method.py",
+            "--method",
+            "00_rtn3",
+            "--config",
+            "unused.yaml",
+            "--output",
+            str(tmp_path),
+            "--device",
+            "cpu",
+        ],
+    )
+
+    run_method.main()
+
+    assert captured == {
+        "method_id": "00_rtn3",
+        "rtn4_ppl": None,
+        "out_root": tmp_path,
+    }
 
 
 def test_method_stochastic_rounding_against_real_block_shaped_model():
